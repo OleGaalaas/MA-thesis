@@ -6,29 +6,11 @@ import pandas as pd
 import translators as ts
 from tqdm import tqdm
 
-# ---------- CSV SAFETY HELPER ----------
-import re
-
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
-
-def clean_for_csv(x):
-    """
-    Remove problematic control characters that can break CSV writing on Windows.
-    Keeps: \t (0x09), \n (0x0A), \r (0x0D).
-    Removes: NUL and other control chars.
-    """
-    if x is None:
-        return ""
-    s = str(x)
-    return _CONTROL_CHARS.sub("", s)
-
-
-
 # ---------- CONFIG ----------
-INPUT_FILE = r"C:\Users\olemga\OneDrive - PRIO\Documents\MA Thesis\Methods\Data\Input\lenta_news_1999_2024_subset.csv"
+INPUT_FILE = r"C:\Users\olemga\OneDrive - PRIO\Documents\MA Thesis\Methods\Data\Input\lenta-ru-news.expert_ru_subset.csv"
 
-OUTPUT_TEMPLATE = r"C:\lenta_translate\lenta_news_1999_2024_subset.translated_shard{shard_id}.csv"
-ERROR_LOG_TEMPLATE = r"C:\lenta_translate\lenta_news_1999_2024_subset.errors_shard{shard_id}.csv"
+OUTPUT_TEMPLATE = r"C:\Users\olemga\OneDrive - PRIO\Documents\MA Thesis\Methods\Data\Input\lenta-ru-news.expert_ru_subset.translated_shard{shard_id}.csv"
+ERROR_LOG_TEMPLATE = r"C:\Users\olemga\OneDrive - PRIO\Documents\MA Thesis\Methods\Data\Input\lenta-ru-news.expert_ru_subset.errors_shard{shard_id}.csv"
 
 # Translate ONLY these columns
 COLUMNS_TO_TRANSLATE = ["title", "text"]
@@ -38,13 +20,12 @@ SRC_LANG = "ru"
 TGT_LANG = "en"
 
 # Chunking parameters
-CHUNKSIZE = 400
+CHUNKSIZE = 300
 SLEEP_BETWEEN_ROWS = 0.2    # small random delay added inside translation fn
 SLEEP_BETWEEN_CHUNKS = 60   # take long breaks between chunks
 
 # Retries per row
 MAX_RETRIES = 5
-
 
 
 # ---------- TRANSLATION (YANDEX-ONLY) ----------
@@ -175,20 +156,7 @@ def main(shard_id, num_shards):
         mode = "w" if first_chunk else "a"
         header = first_chunk
 
-        # Clean all object columns before writing
-        obj_cols = shard_df.select_dtypes(include=["object"]).columns
-        for c in obj_cols:
-            shard_df[c] = shard_df[c].map(clean_for_csv)
-
-        shard_df.to_csv(
-            output_file,
-            mode=mode,
-            header=header,
-            index=False,
-            encoding="utf-8",
-            lineterminator="\n",
-        )
-
+        shard_df.to_csv(output_file, mode=mode, header=header, index=False, encoding="utf-8")
         first_chunk = False
 
         # Update resume pointer
