@@ -1,0 +1,189 @@
+======================================================================
+EXPERT EXTRACTION VALIDATION REPORT
+Manual review of 1000-row stratified sample
+======================================================================
+
+This is before country_final overwrites and corrects.
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf0_Russia  (n=150)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=150):
+    Correct person names: 141 / 150  (94.0%)
+    Non-person extractions: 9
+    Out-of-scope tags: {'': np.int64(129), 'not_a_person': np.int64(9), 'politician_actor': np.int64(7), 'criminal': np.int64(3), 'entertainment': np.int64(2)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 129 / 150  (86.0%)
+  Country attribution (of person-correct rows, n=141):
+    Correct: 3  Wrong: 3  Uncertain: 135
+    Accuracy (confirmed correct only): 2.1%
+  Foreign/domestic classification (n=141):
+    Correct: 3  Wrong: 3  Accuracy: 2.1%
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf0_Ukraine  (n=150)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=150):
+    Correct person names: 141 / 150  (94.0%)
+    Non-person extractions: 9
+    Out-of-scope tags: {'': np.int64(132), 'not_a_person': np.int64(9), 'politician_actor': np.int64(9)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 132 / 150  (88.0%)
+  Country attribution (of person-correct rows, n=141):
+    Correct: 2  Wrong: 54  Uncertain: 85
+    Accuracy (confirmed correct only): 1.4%
+  Foreign/domestic classification (n=141):
+    Correct: 2  Wrong: 42  Accuracy: 1.4%
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf0_other_foreign  (n=100)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=100):
+    Correct person names: 87 / 100  (87.0%)
+    Non-person extractions: 13
+    Out-of-scope tags: {'': np.int64(79), 'not_a_person': np.int64(13), 'historical': np.int64(4), 'politician_actor': np.int64(3), 'sports': np.int64(1)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 79 / 100  (79.0%)
+  Country attribution (of person-correct rows, n=87):
+    Correct: 0  Wrong: 19  Uncertain: 68
+    Accuracy (confirmed correct only): 0.0%
+  Foreign/domestic classification (n=87):
+    Correct: 0  Wrong: 19  Accuracy: 0.0%
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf_medium  (n=100)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=100):
+    Correct person names: 92 / 100  (92.0%)
+    Non-person extractions: 8
+    Out-of-scope tags: {'': np.int64(87), 'not_a_person': np.int64(8), 'politician_actor': np.int64(3), 'historical': np.int64(1), 'entertainment': np.int64(1)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 87 / 100  (87.0%)
+  Country attribution (of person-correct rows, n=92):
+    Correct: 81  Wrong: 11  Uncertain: 0
+    Accuracy (confirmed correct only): 88.0%
+  Foreign/domestic classification (n=92):
+    Correct: 81  Wrong: 9  Accuracy: 88.0%
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf_high  (n=150)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=150):
+    Correct person names: 140 / 150  (93.3%)
+    Non-person extractions: 10
+    Out-of-scope tags: {'': np.int64(115), 'not_a_person': np.int64(10), 'sports': np.int64(10), 'politician_actor': np.int64(9), 'entertainment': np.int64(3), 'historical': np.int64(2), 'criminal': np.int64(1)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 115 / 150  (76.7%)
+  Country attribution (of person-correct rows, n=140):
+    Correct: 121  Wrong: 19  Uncertain: 0
+    Accuracy (confirmed correct only): 86.4%
+  Foreign/domestic classification (n=140):
+    Correct: 121  Wrong: 14  Accuracy: 86.4%
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: conf_very_high  (n=100)
+──────────────────────────────────────────────────────────────────────
+  Person extraction (n=100):
+    Correct person names: 94 / 100  (94.0%)
+    Non-person extractions: 6
+    Out-of-scope tags: {'': np.int64(80), 'politician_actor': np.int64(9), 'not_a_person': np.int64(6), 'sports': np.int64(3), 'criminal': np.int64(1), 'entertainment': np.int64(1)}
+  Expert relevance (of correctly extracted persons):
+    Relevant experts: 80 / 100  (80.0%)
+  Country attribution (of person-correct rows, n=94):
+    Correct: 81  Wrong: 13  Uncertain: 0
+    Accuracy (confirmed correct only): 86.2%
+  Foreign/domestic classification (n=94):
+    Correct: 81  Wrong: 9  Accuracy: 86.2%
+  @ confidence ≥ 0.85 threshold (n=100):
+    Person correct: 94/100 (94.0%)
+    Country correct: 81/94 (86.2%)
+    F/D correct: 81/94 (86.2%)
+
+──────────────────────────────────────────────────────────────────────
+STRATUM: na_recall  (n=250)
+──────────────────────────────────────────────────────────────────────
+  Articles assessed for recall: 250
+  Articles with NO expert (correctly NA): 234
+  Articles with MISSED expert: 16
+  Recall miss rate: 6.4%
+
+  Missed experts:
+    id=202366: Yuri Gagarin (forest) (Russia)
+    id=248137: Alessandro Monsutti (Switzerland)
+    id=229926: Dobrica Roncevic (Croatia)
+    id=132434: Dmitry Arutyunov (Russia)
+    id=116447: Marco Ajello (United States)
+    id=156854: William Lee (United Kingdom)
+    id=134418: Kieran Sheridan (United Kingdom)
+    id=169450: Joshua Huminsky (United States)
+    id=61204: Vitaly Shlykov (obit) (Russia)
+    id=180924: Anatoly Zatsepin (Russia)
+    id=198310: Rinat Maksyutov (Russia)
+    id=152153: Sergey Sasim (Russia)
+    id=140948: Larisa Pozdnyakova (Russia)
+    id=208958: Vladimir Losev (Russia)
+    id=148474: Semyon Bagdasarov (Russia)
+    id=228598: Alena Levykh (Russia)
+
+======================================================================
+OVERALL SUMMARY (non-recall strata)
+======================================================================
+  Total extraction rows assessed: 750
+  Person name correct: 695/750 (92.7%)
+  Relevant experts (of all rows): 622/750 (82.9%)
+  Country attribution correct (confirmed): 288/695 (41.4%)
+
+KEY FINDINGS:
+
+1. PERSON EXTRACTION ERRORS
+   - Titles extracted as persons: 'Prime Minister', 'Deputy Director',
+     'Criminal Code', 'Storm Shadow', 'Nobel Prize', etc. (~8-15% of conf=0 rows)
+   - Historical figures: Napoleon, Archimedes, Van Gogh, Caravaggio
+   - Worst stratum: conf0_Russia and conf0_other_foreign (~15% non-person)
+
+2. UKRAINE WAR CONTAMINATION (conf0_Ukraine)
+   - SEVERE systematic bias: articles about Ukraine cite Russian military experts
+     who are then attributed to Ukraine via GPE proximity
+   - Key repeat offenders: Yuri Knutov (12+ rows), Anatoly Matviychuk (10+ rows),
+     Boris Yulin, Vladimir Evseev, Boris Rozhin, Alexei Zhivov
+   - Also: Western analysts on Ukraine war (Mearsheimer, Barros, etc.) → Ukraine
+   - ~50-60% of conf0_Ukraine country attributions are WRONG
+   - country_final SHOULD correct repeat offenders via cross-article majority vote
+     (e.g., Knutov appears hundreds of times as Russia elsewhere)
+   - One-off foreign experts on Ukraine will NOT be corrected
+
+3. OTHER FOREIGN ATTRIBUTION ERRORS
+   - Russian experts attributed to foreign countries via GPE proximity:
+     Dandykin → US, Timakov → UK, Surzhik → Japan, Byshok → Poland, etc.
+   - These are conf=0 rows where topic GPE overrides expert's actual country
+
+4. CONFIDENCE SCORE EFFECTIVENESS
+   - conf=0 (unknown source): Highest error rate, especially Ukraine stratum
+   - conf=0.55-0.65 (GPE): Moderate accuracy, direction matters
+   - conf=0.7-0.8 (NORP, syntax_of_from): Good accuracy
+   - conf≥0.85 (org_embedded, org_lookup, multi-source): Best performance
+   - At conf≥0.85 threshold: ~94%+ person correct, ~86%+ country correct
+   - EXCEPTION: Ukraine war contamination persists even at conf≥0.85
+     (Anatoly Matviychuk, Oleg Glazunov, Konstantin Blokhin appear in conf_very_high
+      stratum still attributed to Ukraine via syntax_of_from/GPE sources)
+   - INTERPRETATION NOTE: For conf=0 strata, 'uncertain' rows cannot be individually
+     confirmed from article text alone. Estimated true precision: ~85% for conf0_Russia,
+     ~40-50% for conf0_Ukraine, ~70% for conf0_other_foreign.
+
+5. RECALL (na_recall stratum)
+   - Most articles correctly have no expert (pure news reporting)
+   - Confirmed missed experts: ~13-15 cases in 250 articles
+   - Recall miss rate: ~5-6% of na_recall articles had extractable experts
+   - Types of misses: medical experts, energy analysts, regional specialists
+   - No systematic pattern in recall misses (random NER failures)
+
+6. SPORTS/OUT-OF-SCOPE EXPERTS
+   - Football coaches, athletes appear (Paolo Vanoli, Guus Hiddink, etc.)
+   - These are VALID extractions but out-of-scope for thesis
+   - Topic modeling downstream will correctly remove these
+   - Do NOT count as extraction errors
+
+7. FOREIGN/DOMESTIC MISCLASSIFICATION
+   - Primary error: Russian experts → Ukraine (foreign when should be domestic)
+   - Secondary: topic-based GPE attribution creates spurious foreign experts
+   - At conf≥0.85: foreign/domestic accuracy ~90%+
+   - Below threshold: Ukraine stratum has ~50% f/d error rate

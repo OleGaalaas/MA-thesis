@@ -1,0 +1,36 @@
+============================================================
+SENTENCE WINDOW VALIDATION RESULTS
+============================================================
+Total pipeline rows (target-mention pairs): 34,196
+  Neutral:      23,696  (69.3%)
+  Non-neutral:  10,500  (30.7%)
+Article text found: 34,196 / 34,196
+Mention sentence located in article: 34,098 / 34,196
+
+--- Window: +1 sentence(s) after mention ---
+  DATA LOSS ESTIMATE (neutral rows that have eval in next +1 sent):
+    Neutral rows with retrievable next context: 21,440
+    Of those, next sent has target + eval signal: 1,507  (7.0%)
+    As % of ALL neutral rows: 6.4%
+      Foreign: 951 / 11,311  (8.4%)
+      Domestic: 556 / 10,129  (5.5%)
+
+  NOISE ESTIMATE (non-neutral rows that FLIP with next +1 sent):
+    Non-neutral rows with retrievable next context: 9,490
+    Of those, direction flips: 438  (4.6%)
+      Foreign: 277 / 5,703  (4.9%)
+      Domestic: 161 / 3,787  (4.3%)
+
+--- Window: +2 sentence(s) after mention ---
+  DATA LOSS ESTIMATE (neutral rows that have eval in next +2 sent):
+    Neutral rows with retrievable next context: 18,724
+    Of those, next sent has target + eval signal: 3,002  (16.0%)
+    As % of ALL neutral rows: 12.7%
+      Foreign: 1,761 / 9,874  (17.8%)
+      Domestic: 1,241 / 8,850  (14.0%)
+
+  NOISE ESTIMATE (non-neutral rows that FLIP with next +2 sent):
+    Non-neutral rows with retrievable next context: 8,125
+    Of those, direction flips: 583  (7.2%)
+      Foreign: 369 / 4,843  (7.6%)
+      Domestic: 214 / 3,282  (6.5%)

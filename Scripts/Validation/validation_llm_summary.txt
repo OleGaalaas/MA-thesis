@@ -1,0 +1,37 @@
+=================================================================
+LLM VALIDATION RESULTS  (my annotation as ground truth, n=150)
+=================================================================
+Overall agreement: 68.0%
+
+--- Precision / Recall (non-neutral pipeline rows, n=100) ---
+  POSITIVE:
+    Precision=0.4  Recall=0.952  F1=0.563
+    TP=20  FP=30  FN=1
+  NEGATIVE:
+    Precision=0.8  Recall=0.755  F1=0.777
+    TP=40  FP=10  FN=13
+
+--- Confusion matrix (non-neutral pipeline rows) ---
+Pipeline  negative  positive  All
+My GT                            
+negative        40        13   53
+neutral          9        17   26
+positive         1        20   21
+All             50        50  100
+
+--- Agreement by domestic / foreign (non-neutral rows) ---
+  Foreign: 31/50 correct  (62.0%)
+  Domestic: 29/50 correct  (58.0%)
+
+--- False negative estimate (neutral pipeline rows, n=50) ---
+  Neutral rows I disagree with: 8/50  (16.0%)
+    Foreign: 6/25  (24.0%)
+    Domestic: 2/25  (8.0%)
+
+--- Error rate by domestic / foreign (non-neutral rows) ---
+  Foreign: 19/50 errors  (38.0%)
+  Domestic: 21/50 errors  (42.0%)
+
+--- Direction flips (wrong sign, not just neutral confusion) ---
+  Pipeline=positive, GT=negative: 13
+  Pipeline=negative, GT=positive: 1
