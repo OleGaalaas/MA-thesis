@@ -1,2 +1,5 @@
-# MA-thesis
-Ole Magnus sin Masteroppgave
+# Master thesis repository Ole Magnus Gaalaas-Hansen
+
+Welcome to my repository!
+
+Have a look around :) 
