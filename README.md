@@ -44,7 +44,3 @@ I do not provide the rest of the datasets used for three reasons.
 
 
 
-
-The dataset is anonymized as per agreement with SIKT. 
-
-
