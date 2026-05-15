@@ -29,7 +29,7 @@ The folder "Directed sentiment" proveds the scripts for the sentiment procedures
 "04a_validation_sentence_window" is the script for the LLM test of different sentence windows for directed sentiment"
 "04b_validation_llm_judge 2" is the script for the LLM validation. 
 
-The folder "Analysis and visualization" contains the script "analysis" which are used for the analysis. You should be able to run using the "expert_topic_sentiment_master_anonymised" dataset. 
+The folder "Analysis and visualization" contains the script "analysis" which are used for the analysis. You should be able to run using the "expert_topic_sentiment_master_anonymised" dataset. I also added the "sandbox" script i worked with in this folder. 
 
 DATA: 
 "expert_topic_sentiment_master_anonymised" is the main dataset used for the analysis. 
