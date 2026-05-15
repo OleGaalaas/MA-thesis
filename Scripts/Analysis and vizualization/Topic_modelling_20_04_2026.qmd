@@ -1,0 +1,689 @@
+---
+title: "Topic modelling 20.04.2026"
+author: "Ole Magnus Gaalaas-Hansen"
+format: html
+editor: visual
+---
+
+# Packages
+
+```{r}
+
+library(data.table)
+library(stringi)
+library(quanteda)
+library(topicmodels)
+library(stopwords)
+library(ggplot2)
+library(scales)
+```
+
+# LOAD BASE DATASETS
+
+```{r}
+
+# Load datasets from CSV
+mentions <- fread(
+  "C:/Users/olemga/OneDrive - PRIO/Documents/MA Thesis/Methods/Data/Output/lenta_experts_trf_1999_2024_mentions.csv"
+)
+articles <- fread(
+  "C:/Users/olemga/OneDrive - PRIO/Documents/MA Thesis/Methods/Data/Translated files/lenta_news_1999_2024_translated_all.csv"
+)
+
+# Ensure date formats
+mentions[, DateParsed := as.Date(DateParsed)]
+articles[, date := as.Date(date)]
+
+# Sanity check: ID alignment
+
+all(unique(mentions$row_id) %in% unique(articles$orig_row_id))
+
+
+```
+
+# a better filter
+
+```{r}
+
+library(data.table)
+library(data.table)
+setDT(mentions)
+
+# Ensure numeric
+mentions[, mention_country_confidence := as.numeric(mention_country_confidence)]
+
+# Keep only usable country evidence
+country_evidence <- mentions[
+  !is.na(expert_id) &
+  mention_country != "Unknown" &
+  !is.na(mention_country_confidence)
+]
+
+# Expert master country = country with highest confidence
+# (If ties, pick the one appearing most often among tied max)
+expert_master_country <- country_evidence[
+  ,
+  {
+    maxc <- max(mention_country_confidence, na.rm = TRUE)
+    top <- .SD[mention_country_confidence == maxc]
+    # tie-break: most frequent among the max-confidence mentions
+    best_country <- top[, .N, by = mention_country][order(-N)][1, mention_country]
+    .(expert_country_master = best_country, expert_country_maxconf = maxc)
+  },
+  by = expert_id
+]
+
+CONF_THRESH <- 0.70
+
+mentions <- merge(
+  mentions,
+  expert_master_country,
+  by = "expert_id",
+  all.x = TRUE
+)
+
+mentions[, mention_country_confidence := as.numeric(mention_country_confidence)]
+
+mentions[, country_final := fifelse(
+  mention_country != "Unknown" & !is.na(mention_country_confidence) & mention_country_confidence >= CONF_THRESH,
+  mention_country,
+  expert_country_master
+)]
+
+# If still NA, set to Unknown for clarity
+mentions[is.na(country_final), country_final := "Unknown"]
+
+# ── NEW: track where country_final came from ───────────────────────────────────
+mentions[, country_final_source := fcase(
+  
+  # Article-level evidence was strong enough on its own
+  mention_country != "Unknown" &
+    !is.na(mention_country_confidence) &
+    mention_country_confidence >= CONF_THRESH,
+  "article_level",
+  
+  # Majority vote kicked in but master country has high confidence
+  # (expert appears many times with strong evidence elsewhere in corpus)
+  !is.na(expert_country_master) &
+    expert_country_maxconf >= CONF_THRESH,
+  "majority_vote_high_conf",
+  
+  # Majority vote kicked in but master country confidence is low
+  # (expert rarely appears with strong evidence)
+  !is.na(expert_country_master) &
+    expert_country_maxconf > 0 &
+    expert_country_maxconf < CONF_THRESH,
+  "majority_vote_low_conf",
+  
+  # Majority vote kicked in but confidence is zero
+  # (never had any direct evidence anywhere in corpus, pure frequency)
+  !is.na(expert_country_master) &
+    expert_country_maxconf == 0,
+  "majority_vote_zero_conf",
+  
+  default = "unknown"
+)]
+# ──────────────────────────────────────────────────────────────────────────────
+
+mentions[, is_foreign_final := country_final != "Russia" & country_final != "Unknown"]
+
+mentions <- mentions[
+  person != "Unknown" &
+  country_final != "Unknown"
+]
+
+# Check distribution
+mentions[, .N, by = country_final_source][
+  order(-N)
+][, pct := N / sum(N) * 100][] %>%
+  print()
+fwrite(mentions, "mentions_dataset_for_sentiment.csv")
+
+# After the overwrite, effective confidence for each row is:
+# - mention_country_confidence if article_level
+# - expert_country_maxconf if majority_vote
+
+mentions[, effective_confidence := fcase(
+  country_final_source == "article_level",           mention_country_confidence,
+  country_final_source == "majority_vote_high_conf", expert_country_maxconf,
+  country_final_source == "majority_vote_low_conf",  expert_country_maxconf,
+  default = NA_real_
+)]
+
+mentions[, conf_tier := fcase(
+  effective_confidence == 0,                                        "Low",
+  effective_confidence > 0  & effective_confidence < 0.70,         "Medium",
+  effective_confidence >= 0.70 & effective_confidence < 0.85,      "High",
+  effective_confidence >= 0.85,                                     "Very high",
+  default = NA_character_
+)]
+
+mentions[, .N, by = .(conf_tier, effective_confidence)][order(effective_confidence)] %>% print()
+
+# Check total rows in mentions after filtering
+nrow(mentions)
+
+# And distribution
+mentions[, .N, by = conf_tier][order(conf_tier)]
+```
+
+### Testing low confidence removal
+
+```{r}
+library(dplyr)
+
+cat("Raw mentions (before any filtering):\n")
+print(nrow(lenta_experts_trf_1999_2024_mentions))
+
+cat("\nPerson == Unknown:\n")
+print(sum(lenta_experts_trf_1999_2024_mentions$person == "Unknown", na.rm = TRUE))
+
+cat("\nPerson is NA:\n")
+print(sum(is.na(lenta_experts_trf_1999_2024_mentions$person)))
+
+cat("\nPerson != Unknown and not NA:\n")
+n_with_person <- sum(
+  lenta_experts_trf_1999_2024_mentions$person != "Unknown" & 
+  !is.na(lenta_experts_trf_1999_2024_mentions$person)
+)
+print(n_with_person)
+
+cat("\nDropped at country stage (had person, not in final dataset):\n")
+print(n_with_person - nrow(mentions))
+
+cat("\nFinal dataset:\n")
+print(nrow(mentions))
+
+```
+
+```{r}
+
+# Get the dropped rows - had person but not in final dataset
+dropped <- lenta_experts_trf_1999_2024_mentions %>%
+  filter(person != "Unknown") %>%
+  anti_join(mentions, by = "row_id")
+
+cat("Dropped rows - mention_country distribution:\n")
+dropped %>%
+  count(mention_country) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print(n = 20)
+
+cat("\nDropped rows - mention_country_confidence distribution:\n")
+dropped %>%
+  count(mention_country_confidence) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print()
+
+cat("\nDropped rows - mention_country_sources distribution:\n")
+dropped %>%
+  count(mention_country_sources) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print(n = 20)
+
+cat("Difference between named-person rows and dropped + final:\n")
+print(119456 - 37101 - 76938)
+
+cat("Top 30 most frequent persons in dropped rows:\n")
+dropped %>%
+  count(person) %>%
+  arrange(desc(n)) %>%
+  print(n = 30)
+
+cat("\nRandom sample of 30 names from dropped rows:\n")
+dropped %>%
+  distinct(person) %>%
+  sample_n(30) %>%
+  print()
+```
+
+# FILTER VALID EXPERT MENTIONS
+
+# DIRECT MERGE VIA ROW_ID (NO STRING MATCHING)
+
+```{r}
+
+final_data <- merge(
+  mentions,
+  articles[, .(orig_row_id, text_en, title_en, date)],
+  by.x = "row_id",
+  by.y = "orig_row_id",
+  all.x = TRUE
+)
+
+
+
+```
+
+# BUILD ARTICLE-LEVEL DATASET
+
+```{r}
+
+article_level <- final_data[
+  ,
+  .(
+    DateParsed = first(DateParsed),
+    text_en    = first(text_en),
+    title_en   = first(title_en),
+    n_mentions = .N,
+    mention_sentences = paste(unique(sentence), collapse = " ||| ")
+  ),
+  by = row_id
+]
+
+article_level[, doc_text := paste(title_en, text_en, sep = ". ")]
+
+fwrite(article_level, "article_level_clean.csv")
+```
+
+# HARD-NEWS TOPIC MODELLING (TEST 4 CLEAN VERSION)
+
+## Hard-News Filtering
+
+```{r}
+#| eval: false
+
+article_level[, title_lc := tolower(title_en)]
+
+exclude_pat <- paste0(
+  "(",
+  paste(c(
+    "match","team","league","football","hockey","film","movie","actor",
+    "concert","weather","forecast","recipe","diet","fashion","tips"
+  ), collapse="|"),
+  ")"
+)
+
+article_level <- article_level[!stri_detect_regex(title_lc, exclude_pat)]
+article_level[, title_lc := NULL]
+```
+
+## Tokenization
+
+```{r}
+#| eval: false
+
+corp <- corpus(article_level$doc_text)
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks <- tokens_tolower(toks)
+
+news_stopwords <- c(
+  "said","according","earlier","new","one","two",
+  "also","can","may","year","years","reported"
+)
+
+toks <- tokens_remove(toks, c(stopwords("en"), news_stopwords))
+
+keep_docs <- lengths(toks) > 40
+toks <- toks[keep_docs]
+article_level <- article_level[keep_docs]
+```
+
+## DFM + Trim
+
+```{r}
+#| eval: false
+
+dfm_all <- dfm_trim(
+  dfm_all,
+  min_docfreq = 30,
+  max_docfreq = 0.6 * ndoc(dfm_all),
+  docfreq_type = "count"
+)
+
+non_empty <- ntoken(dfm_all) > 0
+
+dfm_all <- dfm_all[non_empty, ]
+
+article_level <- article_level[non_empty]
+```
+
+New filtering with better stopwords:
+
+```{r}
+
+# ----------------------------------------------------------
+# 1) HARD-NEWS FILTER (Title-based exclusion)
+# ----------------------------------------------------------
+
+article_level[, title_lc := tolower(title_en)]
+
+exclude_pat <- paste0(
+  "(",
+  paste(c(
+    # sports
+    "match","matches","team","club","coach","league","championship","tournament","football","soccer",
+    "hockey","nba","nhl","fifa","olympic","olympics","race","grand prix",
+    # culture/entertainment
+    "film","movie","cinema","actor","actress","director","singer","concert","album","tv","series",
+    "show","theater","theatre","book","novel","literature","festival","premiere","museum",
+    # weather
+    "weather","forecast","temperature","storm","snow","rain","wind","heat","cold",
+    # lifestyle / advice
+    "recipe","cook","diet","fitness","beauty","fashion","psychologist","relationship",
+    "children","parent","pregnan","doctor recommends","tips","how to"
+  ), collapse = "|"),
+  ")"
+)
+
+article_level <- article_level[!stri_detect_regex(title_lc, exclude_pat)]
+article_level[, title_lc := NULL]
+
+gc()
+
+# ----------------------------------------------------------
+# 2) Tokenization
+# ----------------------------------------------------------
+
+corp <- corpus(article_level$doc_text)
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks <- tokens_tolower(toks)
+
+# ----------------------------------------------------------
+# 3) Stopwords (stronger cleaning)
+# ----------------------------------------------------------
+
+news_stopwords <- c(
+  "said","according","earlier","new","one","two","first",
+  "also","can","may","time","year","years","reported",
+  "found","known","made","way","need","even","many","get","help",
+  "people","url","now","however","even","still","today"
+)
+
+expert_role_stopwords <- c(
+  "expert","experts","specialist","specialists","professor","professors",
+  "doctor","doctors","scientist","scientists","researcher","researchers",
+  "analyst","analysts","economist","economists","lawyer","lawyers",
+  "institute","university","academy","center","centre","department",
+  "ministry","director","head"
+)
+
+reporting_verbs <- c(
+  "said","told","explained","noted","added","stated","called",
+  "announced","commented","emphasized","pointed","claimed"
+)
+
+toks <- tokens_remove(
+  toks,
+  c(stopwords("en"),
+    news_stopwords,
+    expert_role_stopwords,
+    reporting_verbs)
+)
+
+# Remove ultra-short tokens
+toks <- tokens_keep(toks, pattern = "^[a-z]{3,}$", valuetype = "regex")
+
+# ----------------------------------------------------------
+# 4) Remove short documents AFTER cleaning
+# ----------------------------------------------------------
+
+keep_docs <- lengths(toks) > 50
+
+toks <- toks[keep_docs]
+article_level <- article_level[keep_docs]
+
+gc()
+
+# ----------------------------------------------------------
+# 5) DFM + Trim
+# ----------------------------------------------------------
+
+dfm_all <- dfm(toks)
+
+dfm_all <- dfm_trim(
+  dfm_all,
+  min_docfreq = 30,
+  max_docfreq = 0.6 * ndoc(dfm_all),
+  docfreq_type = "count"
+)
+
+non_empty <- ntoken(dfm_all) > 0
+dfm_all <- dfm_all[non_empty, ]
+article_level <- article_level[non_empty]
+
+gc()
+
+```
+
+## LDA
+
+```{r}
+dtm <- convert(dfm_all, to = "topicmodels")
+
+K <- 15
+set.seed(123)
+
+lda_fit <- LDA(
+  dtm,
+  k = K,
+  method = "Gibbs",
+  control = list(iter=1200, burnin=200, thin=100, seed=123)
+)
+
+# Save model and vocabulary for robustness check
+saveRDS(lda_fit,          "lda_fit_k15.rds")
+saveRDS(featnames(dfm_all), "lda_vocab_k15.rds")
+
+theta <- posterior(lda_fit)$topics
+theta_dt <- as.data.table(theta)
+setnames(theta_dt, paste0("topic_", 1:K))
+
+hardnews_topics_k15_fast <- cbind(
+  article_level[, .(row_id, DateParsed, n_mentions)],
+  theta_dt
+)
+top_terms <- terms(lda_fit, 15)
+print(top_terms)
+
+setnames(hardnews_topics_k15_fast,
+         old = paste0("topic_", 1:15),
+         new = c(
+           "macro_economy",
+           "media_society",
+           "general_news",
+           "housing_market",
+           "opinion_discourse",
+           "covid_health",
+           "development_education",
+           "energy_sanctions",
+           "military_technology",
+           "information_services",
+           "kremlin_governance",
+           "courts_crime",
+           "regions_local",
+           "ukraine_war",
+           "international_geopolitics"
+         ))
+
+fwrite(hardnews_topics_k15_fast, "hardnews_topics_k15_fast.csv")
+```
+
+# ROBUSTNESS CHECK: DROPPED EXPERTS
+
+Test whether articles containing experts with no country cues have a similar topic distribution to articles with confirmed domestic (Russian) experts. If they do, the assumption that dropped experts are mostly Russian holds.
+
+## Build article-level dataset for dropped mentions
+
+```{r}
+
+topic_cols <- c(
+  "macro_economy", "media_society", "general_news",
+  "housing_market", "opinion_discourse", "covid_health",
+  "development_education", "energy_sanctions", "military_technology",
+  "information_services", "kremlin_governance", "courts_crime",
+  "regions_local", "ukraine_war", "international_geopolitics"
+)
+
+dropped_dt <- as.data.table(dropped)
+
+# Join dropped mentions with full article text
+dropped_articles <- merge(
+  dropped_dt[, .(row_id)],
+  articles[, .(orig_row_id, text_en, title_en, date)],
+  by.x = "row_id",
+  by.y = "orig_row_id",
+  all.x = TRUE
+)
+
+# Deduplicate to article level
+dropped_al <- dropped_articles[
+  !is.na(text_en),
+  .(
+    DateParsed = first(date),
+    text_en    = first(text_en),
+    title_en   = first(title_en)
+  ),
+  by = row_id
+]
+
+dropped_al[, doc_text := paste(title_en, text_en, sep = ". ")]
+
+cat("Dropped articles with full text:", nrow(dropped_al), "\n")
+```
+
+## Apply same preprocessing pipeline
+
+```{r}
+
+# Hard-news filter (same exclude_pat as above)
+dropped_al[, title_lc := tolower(title_en)]
+dropped_al <- dropped_al[!stri_detect_regex(title_lc, exclude_pat)]
+dropped_al[, title_lc := NULL]
+
+corp_d <- corpus(dropped_al$doc_text)
+
+toks_d <- tokens(
+  corp_d,
+  remove_punct   = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks_d <- tokens_tolower(toks_d)
+
+toks_d <- tokens_remove(
+  toks_d,
+  c(stopwords("en"), news_stopwords, expert_role_stopwords, reporting_verbs)
+)
+
+toks_d <- tokens_keep(toks_d, pattern = "^[a-z]{3,}$", valuetype = "regex")
+
+keep_d <- lengths(toks_d) > 50
+toks_d <- toks_d[keep_d]
+dropped_al <- dropped_al[keep_d]
+
+cat("Dropped articles after preprocessing:", nrow(dropped_al), "\n")
+```
+
+## Align DFM to original vocabulary and infer topics
+
+```{r}
+
+dfm_d <- dfm(toks_d)
+
+# Align to the vocabulary the LDA was trained on
+dfm_d <- dfm_match(dfm_d, featnames(dfm_all))
+
+non_empty_d <- ntoken(dfm_d) > 0
+dfm_d    <- dfm_d[non_empty_d, ]
+dropped_al <- dropped_al[non_empty_d]
+
+cat("Dropped articles with non-empty DFM:", nrow(dropped_al), "\n")
+
+dtm_d <- convert(dfm_d, to = "topicmodels")
+
+# Infer topic probabilities using the saved model
+theta_d <- posterior(lda_fit, newdata = dtm_d)$topics
+
+theta_d_dt <- as.data.table(theta_d)
+setnames(theta_d_dt, paste0("topic_", 1:K))
+setnames(theta_d_dt,
+         old = paste0("topic_", 1:K),
+         new = topic_cols)
+
+dropped_topics <- cbind(dropped_al[, .(row_id, DateParsed)], theta_d_dt)
+
+fwrite(dropped_topics, "dropped_topics_k15.csv")
+```
+
+## Compare: domestic vs. dropped topic distributions
+
+```{r}
+
+# Domestic = Russian experts (is_foreign_final == FALSE)
+domestic_row_ids <- mentions[is_foreign_final == FALSE, unique(row_id)]
+domestic_topics  <- hardnews_topics_k15_fast[row_id %in% domestic_row_ids]
+
+mean_domestic <- colMeans(domestic_topics[, ..topic_cols])
+mean_dropped  <- colMeans(dropped_topics[, ..topic_cols])
+
+comparison <- data.table(
+  topic    = topic_cols,
+  domestic = mean_domestic,
+  dropped  = mean_dropped,
+  diff     = mean_dropped - mean_domestic,
+  abs_diff = abs(mean_dropped - mean_domestic)
+)
+
+cat("Topic distribution comparison (domestic vs dropped):\n")
+print(comparison[order(-abs_diff)])
+
+cat("\nCorrelation between mean topic shares:", cor(mean_domestic, mean_dropped), "\n")
+cat("Max absolute difference:", max(comparison$abs_diff), "\n")
+```
+
+## Visualisation
+
+```{r}
+
+library(tidyr)
+
+comp_long <- melt(
+  comparison,
+  id.vars      = "topic",
+  measure.vars = c("domestic", "dropped"),
+  variable.name = "group",
+  value.name    = "mean_share"
+)
+
+comp_long[, group := factor(group,
+  levels = c("domestic", "dropped"),
+  labels = c("Domestic experts (Russia)", "Dropped (unknown country)")
+)]
+
+ggplot(comp_long, aes(x = reorder(topic, mean_share), y = mean_share, fill = group)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  scale_fill_manual(values = c("Domestic experts (Russia)" = "#2166AC",
+                               "Dropped (unknown country)"  = "#D1495B")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(
+    title    = "Topic distribution: Domestic vs. Dropped experts",
+    subtitle = "Mean topic share per article group (LDA k = 15)",
+    x        = NULL,
+    y        = "Mean topic share",
+    fill     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave("topic_comparison_domestic_vs_dropped.png", width = 9, height = 6, dpi = 150)
+```

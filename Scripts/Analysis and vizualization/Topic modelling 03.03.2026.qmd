@@ -1,0 +1,6372 @@
+---
+title: "fixing data and topic modelling"
+author: "Ole Magnus"
+format: html
+editor: visual
+---
+
+# Packages
+
+```{r}
+
+library(data.table)
+library(stringi)
+library(quanteda)
+library(topicmodels)
+library(stopwords)
+library(ggplot2)
+```
+
+# LOAD BASE DATASETS
+
+```{r}
+
+# Convert to data.table
+mentions  <- as.data.table(lenta_experts_trf_1999_2024_mentions)
+articles  <- as.data.table(lenta_news_1999_2024_translated_all)
+
+# Ensure date formats
+mentions[, DateParsed := as.Date(DateParsed)]
+articles[, date := as.Date(date)]
+
+# Sanity check: ID alignment
+
+all(unique(mentions$row_id) %in% unique(articles$orig_row_id))
+
+
+```
+
+# a better filter
+
+```{r}
+
+library(data.table)
+library(data.table)
+setDT(mentions)
+
+# Ensure numeric
+mentions[, mention_country_confidence := as.numeric(mention_country_confidence)]
+
+# Keep only usable country evidence
+country_evidence <- mentions[
+  !is.na(expert_id) &
+  mention_country != "Unknown" &
+  !is.na(mention_country_confidence)
+]
+
+# Expert master country = country with highest confidence
+# (If ties, pick the one appearing most often among tied max)
+expert_master_country <- country_evidence[
+  ,
+  {
+    maxc <- max(mention_country_confidence, na.rm = TRUE)
+    top <- .SD[mention_country_confidence == maxc]
+    # tie-break: most frequent among the max-confidence mentions
+    best_country <- top[, .N, by = mention_country][order(-N)][1, mention_country]
+    .(expert_country_master = best_country, expert_country_maxconf = maxc)
+  },
+  by = expert_id
+]
+
+CONF_THRESH <- 0.70
+
+mentions <- merge(
+  mentions,
+  expert_master_country,
+  by = "expert_id",
+  all.x = TRUE
+)
+
+mentions[, mention_country_confidence := as.numeric(mention_country_confidence)]
+
+mentions[, country_final := fifelse(
+  mention_country != "Unknown" & !is.na(mention_country_confidence) & mention_country_confidence >= CONF_THRESH,
+  mention_country,
+  expert_country_master
+)]
+
+# If still NA, set to Unknown for clarity
+mentions[is.na(country_final), country_final := "Unknown"]
+
+# ── NEW: track where country_final came from ───────────────────────────────────
+mentions[, country_final_source := fcase(
+  
+  # Article-level evidence was strong enough on its own
+  mention_country != "Unknown" &
+    !is.na(mention_country_confidence) &
+    mention_country_confidence >= CONF_THRESH,
+  "article_level",
+  
+  # Majority vote kicked in but master country has high confidence
+  # (expert appears many times with strong evidence elsewhere in corpus)
+  !is.na(expert_country_master) &
+    expert_country_maxconf >= CONF_THRESH,
+  "majority_vote_high_conf",
+  
+  # Majority vote kicked in but master country confidence is low
+  # (expert rarely appears with strong evidence)
+  !is.na(expert_country_master) &
+    expert_country_maxconf > 0 &
+    expert_country_maxconf < CONF_THRESH,
+  "majority_vote_low_conf",
+  
+  # Majority vote kicked in but confidence is zero
+  # (never had any direct evidence anywhere in corpus, pure frequency)
+  !is.na(expert_country_master) &
+    expert_country_maxconf == 0,
+  "majority_vote_zero_conf",
+  
+  default = "unknown"
+)]
+# ──────────────────────────────────────────────────────────────────────────────
+
+mentions[, is_foreign_final := country_final != "Russia" & country_final != "Unknown"]
+
+mentions <- mentions[
+  person != "Unknown" &
+  country_final != "Unknown"
+]
+
+# Check distribution
+mentions[, .N, by = country_final_source][
+  order(-N)
+][, pct := N / sum(N) * 100][] %>%
+  print()
+fwrite(mentions, "mentions_dataset_for_sentiment.csv")
+
+# After the overwrite, effective confidence for each row is:
+# - mention_country_confidence if article_level
+# - expert_country_maxconf if majority_vote
+
+mentions[, effective_confidence := fcase(
+  country_final_source == "article_level",           mention_country_confidence,
+  country_final_source == "majority_vote_high_conf", expert_country_maxconf,
+  country_final_source == "majority_vote_low_conf",  expert_country_maxconf,
+  default = NA_real_
+)]
+
+mentions[, conf_tier := fcase(
+  effective_confidence == 0,                                        "Low",
+  effective_confidence > 0  & effective_confidence < 0.70,         "Medium",
+  effective_confidence >= 0.70 & effective_confidence < 0.85,      "High",
+  effective_confidence >= 0.85,                                     "Very high",
+  default = NA_character_
+)]
+
+mentions[, .N, by = .(conf_tier, effective_confidence)][order(effective_confidence)] %>% print()
+
+# Check total rows in mentions after filtering
+nrow(mentions)
+
+# And distribution
+mentions[, .N, by = conf_tier][order(conf_tier)]
+```
+
+### Testing low confidence removal
+
+```{r}
+library(dplyr)
+
+cat("Raw mentions (before any filtering):\n")
+print(nrow(lenta_experts_trf_1999_2024_mentions))
+
+cat("\nPerson == Unknown:\n")
+print(sum(lenta_experts_trf_1999_2024_mentions$person == "Unknown", na.rm = TRUE))
+
+cat("\nPerson is NA:\n")
+print(sum(is.na(lenta_experts_trf_1999_2024_mentions$person)))
+
+cat("\nPerson != Unknown and not NA:\n")
+n_with_person <- sum(
+  lenta_experts_trf_1999_2024_mentions$person != "Unknown" & 
+  !is.na(lenta_experts_trf_1999_2024_mentions$person)
+)
+print(n_with_person)
+
+cat("\nDropped at country stage (had person, not in final dataset):\n")
+print(n_with_person - nrow(mentions))
+
+cat("\nFinal dataset:\n")
+print(nrow(mentions))
+
+```
+
+```{r}
+
+# Get the dropped rows - had person but not in final dataset
+dropped <- lenta_experts_trf_1999_2024_mentions %>%
+  filter(person != "Unknown") %>%
+  anti_join(mentions, by = "row_id")
+
+cat("Dropped rows - mention_country distribution:\n")
+dropped %>%
+  count(mention_country) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print(n = 20)
+
+cat("\nDropped rows - mention_country_confidence distribution:\n")
+dropped %>%
+  count(mention_country_confidence) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print()
+
+cat("\nDropped rows - mention_country_sources distribution:\n")
+dropped %>%
+  count(mention_country_sources) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print(n = 20)
+
+cat("Difference between named-person rows and dropped + final:\n")
+print(119456 - 37101 - 76938)
+
+cat("Top 30 most frequent persons in dropped rows:\n")
+dropped %>%
+  count(person) %>%
+  arrange(desc(n)) %>%
+  print(n = 30)
+
+cat("\nRandom sample of 30 names from dropped rows:\n")
+dropped %>%
+  distinct(person) %>%
+  sample_n(30) %>%
+  print()
+```
+
+# FILTER VALID EXPERT MENTIONS
+
+# DIRECT MERGE VIA ROW_ID (NO STRING MATCHING)
+
+```{r}
+
+final_data <- merge(
+  mentions,
+  articles[, .(orig_row_id, text_en, title_en, date)],
+  by.x = "row_id",
+  by.y = "orig_row_id",
+  all.x = TRUE
+)
+
+
+final_data_verify <- merge(
+  articles[, .(orig_row_id, text_en, title_en, date)],
+  mentions,
+  by.x = "orig_row_id",
+  by.y = "row_id",
+  all.x = TRUE
+)
+
+# Remove any unexpected NAs
+final_data <- final_data[!is.na(text_en)]
+```
+
+# BUILD ARTICLE-LEVEL DATASET
+
+```{r}
+
+article_level <- final_data[
+  ,
+  .(
+    DateParsed = first(DateParsed),
+    text_en    = first(text_en),
+    title_en   = first(title_en),
+    n_mentions = .N,
+    mention_sentences = paste(unique(sentence), collapse = " ||| ")
+  ),
+  by = row_id
+]
+
+article_level[, doc_text := paste(title_en, text_en, sep = ". ")]
+
+fwrite(article_level, "article_level_clean.csv")
+```
+
+# HARD-NEWS TOPIC MODELLING (TEST 4 CLEAN VERSION)
+
+## Hard-News Filtering
+
+```{r}
+
+
+article_level[, title_lc := tolower(title_en)]
+
+exclude_pat <- paste0(
+  "(",
+  paste(c(
+    "match","team","league","football","hockey","film","movie","actor",
+    "concert","weather","forecast","recipe","diet","fashion","tips"
+  ), collapse="|"),
+  ")"
+)
+
+article_level <- article_level[!stri_detect_regex(title_lc, exclude_pat)]
+article_level[, title_lc := NULL]
+```
+
+## Tokenization
+
+```{r}
+
+corp <- corpus(article_level$doc_text)
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks <- tokens_tolower(toks)
+
+news_stopwords <- c(
+  "said","according","earlier","new","one","two",
+  "also","can","may","year","years","reported"
+)
+
+toks <- tokens_remove(toks, c(stopwords("en"), news_stopwords))
+
+keep_docs <- lengths(toks) > 40
+toks <- toks[keep_docs]
+article_level <- article_level[keep_docs]
+```
+
+## DFM + Trim
+
+```{r}
+
+dfm_all <- dfm_trim(
+  dfm_all,
+  min_docfreq = 30,
+  max_docfreq = 0.6 * ndoc(dfm_all),
+  docfreq_type = "count"
+)
+
+non_empty <- ntoken(dfm_all) > 0
+
+dfm_all <- dfm_all[non_empty, ]
+
+article_level <- article_level[non_empty]
+```
+
+New filtering with better stopwords:
+
+```{r}
+
+# ----------------------------------------------------------
+# 1) HARD-NEWS FILTER (Title-based exclusion)
+# ----------------------------------------------------------
+
+article_level[, title_lc := tolower(title_en)]
+
+exclude_pat <- paste0(
+  "(",
+  paste(c(
+    # sports
+    "match","matches","team","club","coach","league","championship","tournament","football","soccer",
+    "hockey","nba","nhl","fifa","olympic","olympics","race","grand prix",
+    # culture/entertainment
+    "film","movie","cinema","actor","actress","director","singer","concert","album","tv","series",
+    "show","theater","theatre","book","novel","literature","festival","premiere","museum",
+    # weather
+    "weather","forecast","temperature","storm","snow","rain","wind","heat","cold",
+    # lifestyle / advice
+    "recipe","cook","diet","fitness","beauty","fashion","psychologist","relationship",
+    "children","parent","pregnan","doctor recommends","tips","how to"
+  ), collapse = "|"),
+  ")"
+)
+
+article_level <- article_level[!stri_detect_regex(title_lc, exclude_pat)]
+article_level[, title_lc := NULL]
+
+gc()
+
+# ----------------------------------------------------------
+# 2) Tokenization
+# ----------------------------------------------------------
+
+corp <- corpus(article_level$doc_text)
+
+toks <- tokens(
+  corp,
+  remove_punct = TRUE,
+  remove_symbols = TRUE,
+  remove_numbers = TRUE
+)
+
+toks <- tokens_tolower(toks)
+
+# ----------------------------------------------------------
+# 3) Stopwords (stronger cleaning)
+# ----------------------------------------------------------
+
+news_stopwords <- c(
+  "said","according","earlier","new","one","two","first",
+  "also","can","may","time","year","years","reported",
+  "found","known","made","way","need","even","many","get","help",
+  "people","url","now","however","even","still","today"
+)
+
+expert_role_stopwords <- c(
+  "expert","experts","specialist","specialists","professor","professors",
+  "doctor","doctors","scientist","scientists","researcher","researchers",
+  "analyst","analysts","economist","economists","lawyer","lawyers",
+  "institute","university","academy","center","centre","department",
+  "ministry","director","head"
+)
+
+reporting_verbs <- c(
+  "said","told","explained","noted","added","stated","called",
+  "announced","commented","emphasized","pointed","claimed"
+)
+
+toks <- tokens_remove(
+  toks,
+  c(stopwords("en"),
+    news_stopwords,
+    expert_role_stopwords,
+    reporting_verbs)
+)
+
+# Remove ultra-short tokens
+toks <- tokens_keep(toks, pattern = "^[a-z]{3,}$", valuetype = "regex")
+
+# ----------------------------------------------------------
+# 4) Remove short documents AFTER cleaning
+# ----------------------------------------------------------
+
+keep_docs <- lengths(toks) > 50
+
+toks <- toks[keep_docs]
+article_level <- article_level[keep_docs]
+
+gc()
+
+# ----------------------------------------------------------
+# 5) DFM + Trim
+# ----------------------------------------------------------
+
+dfm_all <- dfm(toks)
+
+dfm_all <- dfm_trim(
+  dfm_all,
+  min_docfreq = 30,
+  max_docfreq = 0.6 * ndoc(dfm_all),
+  docfreq_type = "count"
+)
+
+non_empty <- ntoken(dfm_all) > 0
+dfm_all <- dfm_all[non_empty, ]
+article_level <- article_level[non_empty]
+
+gc()
+
+```
+
+## LDA
+
+```{r}
+dtm <- convert(dfm_all, to = "topicmodels")
+
+K <- 15
+set.seed(123)
+
+lda_fit <- LDA(
+  dtm,
+  k = K,
+  method = "Gibbs",
+  control = list(iter=1200, burnin=200, thin=100, seed=123)
+)
+
+theta <- posterior(lda_fit)$topics
+theta_dt <- as.data.table(theta)
+setnames(theta_dt, paste0("topic_", 1:K))
+
+hardnews_topics_k15_fast <- cbind(
+  article_level[, .(row_id, DateParsed, n_mentions)],
+  theta_dt
+)
+top_terms <- terms(lda_fit, 15)
+print(top_terms)
+
+setnames(hardnews_topics_k15_fast,
+         old = paste0("topic_", 1:15),
+         new = c(
+           "macro_economy",
+           "media_society",
+           "general_news",
+           "housing_market",
+           "opinion_discourse",
+           "covid_health",
+           "development_education",
+           "energy_sanctions",
+           "military_technology",
+           "information_services",
+           "kremlin_governance",
+           "courts_crime",
+           "regions_local",
+           "ukraine_war",
+           "international_geopolitics"
+         ))
+
+fwrite(hardnews_topics_k15_fast, "hardnews_topics_k15_fast.csv")
+```
+
+## MENTION-LEVEL ±2 SENTENCE CONTEXT WINDOWS
+
+```{r}
+results_list <- vector("list", nrow(article_level))
+
+for (i in seq_len(nrow(article_level))) {
+  
+  full_text <- article_level$text_en[i]
+  mentions  <- article_level$mention_sentences[i]
+  orig_row_id <- article_level$orig_row_id[i]
+  
+  if (is.na(full_text) || is.na(mentions)) next
+  
+  sents <- unlist(stri_split_boundaries(full_text, type = "sentence"))
+  sents <- stri_trim_both(sents)
+  sents <- sents[nchar(sents) > 0]
+  
+  mention_list <- unlist(strsplit(mentions, " \\|\\|\\| "))
+  mention_list <- stri_trim_both(mention_list)
+  
+  mention_rows <- list()
+  
+  for (m in mention_list) {
+    
+    idx <- which(sents == m)
+    if (length(idx) == 0) next
+    
+    j <- idx[1]
+    
+    start <- max(1, j - 2)
+    end   <- min(length(sents), j + 2)
+    
+    context_text <- paste(sents[start:end], collapse=" ")
+    
+    mention_rows[[length(mention_rows)+1]] <- data.table(
+      orig_row_id = orig_row_id,
+      mention_sentence = m,
+      expert_context_text = context_text
+    )
+  }
+  
+  if (length(mention_rows) > 0) {
+    results_list[[i]] <- rbindlist(mention_rows)
+  }
+}
+
+expert_mentions_level <- rbindlist(results_list)
+
+fwrite(expert_mentions_level, "expert_mentions_level_hardnews.csv")
+```
+
+```{r}
+
+library(data.table)
+library(stringi)
+
+setDT(article_level)
+
+# Safety: ensure the key columns exist
+stopifnot(all(c("row_id", "text_en", "mention_sentences") %in% names(article_level)))
+
+results_list <- vector("list", nrow(article_level))
+
+for (i in seq_len(nrow(article_level))) {
+  
+  row_id   <- article_level$row_id[i]
+  full_text <- article_level$text_en[i]
+  mentions  <- article_level$mention_sentences[i]
+  
+  if (is.na(full_text) || is.na(mentions)) next
+  if (nchar(full_text) < 50 || nchar(mentions) < 5) next
+  
+  # Split article into sentences
+  sents <- unlist(stri_split_boundaries(full_text, type = "sentence"))
+  sents <- stri_trim_both(sents)
+  sents <- sents[nchar(sents) > 0]
+  if (length(sents) == 0) next
+  
+  # Split mention sentences
+  mention_list <- unlist(strsplit(mentions, " \\|\\|\\| "))
+  mention_list <- stri_trim_both(mention_list)
+  mention_list <- mention_list[nchar(mention_list) > 0]
+  if (length(mention_list) == 0) next
+  
+  mention_rows <- vector("list", length(mention_list))
+  out_k <- 0L
+  
+  for (m in mention_list) {
+    
+    # Robust match: find sentence(s) that contain m OR where m contains the sentence
+    hits1 <- which(stri_detect_fixed(sents, m))
+    hits2 <- which(stri_detect_fixed(m, sents))
+    idx <- unique(c(hits1, hits2))
+    
+    if (length(idx) == 0) next
+    
+    # If multiple hits, choose the closest-length sentence (best match)
+    if (length(idx) > 1) {
+      lens <- abs(nchar(sents[idx]) - nchar(m))
+      j <- idx[which.min(lens)]
+    } else {
+      j <- idx[1]
+    }
+    
+    # ±2 sentences
+    start <- max(1L, j - 2L)
+    end   <- min(length(sents), j + 2L)
+    
+    context_text <- paste(sents[start:end], collapse = " ")
+    
+    # Cap (optional; keeps embeddings sane)
+    if (nchar(context_text) > 3000) {
+      context_text <- substr(context_text, 1, 3000)
+    }
+    
+    out_k <- out_k + 1L
+    mention_rows[[out_k]] <- data.table(
+      row_id = row_id,                 # <-- KEEP THE ID
+      mention_sentence = m,
+      expert_context_text = context_text
+    )
+  }
+  
+  if (out_k > 0L) {
+    results_list[[i]] <- rbindlist(mention_rows[1:out_k])
+  }
+  
+  if (i %% 5000 == 0) cat("Processed:", i, "\n")
+}
+
+expert_mentions_level <- rbindlist(results_list, use.names = TRUE, fill = TRUE)
+
+# Diagnostics
+cat("Rows:", nrow(expert_mentions_level), "\n")
+cat("Unique row_id:", length(unique(expert_mentions_level$row_id)), "\n")
+print(summary(nchar(expert_mentions_level$expert_context_text)))
+
+# Save
+fwrite(expert_mentions_level, "expert_mentions_level_hardnews.csv")
+
+getwd(
+)
+```
+
+# Merging for full dataset
+
+```{r}
+
+sentiment <- mentions_directed_sentiment_full
+
+topics <- as.data.table(hardnews_topics_k15_fast)
+
+master_dataset <- merge(
+  sentiment,
+  topics,
+  by = "row_id",
+  all.x = TRUE
+)
+
+sum(is.na(master_dataset$ukraine_war))
+
+topic_cols <- c(
+"courts_crime",
+"covid_health",
+"development_education",
+"energy_sanctions",
+"general_news",
+"housing_market",
+"information_services",
+"international_geopolitics",
+"kremlin_governance",
+"macro_economy",
+"media_society",
+"military_technology",
+"opinion_discourse",
+"regions_local",
+"ukraine_war"
+)
+
+master_dataset[topic_cols] <- lapply(master_dataset[topic_cols], function(x) {
+  x[is.na(x)] <- 0
+  x
+})
+
+master_dataset$dominant_topic <- topic_cols[
+  max.col(master_dataset[topic_cols], ties.method = "first")
+]
+
+table(master_dataset$dominant_topic)
+
+sum(rowSums(master_dataset[topic_cols]) == 0)
+
+master_dataset$dominant_topic[rowSums(master_dataset[topic_cols]) == 0] <- "no_topic"
+
+master_dataset$topic_group <- "other"
+
+master_dataset$topic_group[
+master_dataset$dominant_topic %in% c(
+"ukraine_war",
+"international_geopolitics",
+"military_technology",
+"energy_sanctions"
+)] <- "geopolitics"
+
+master_dataset$topic_group[
+master_dataset$dominant_topic %in% c(
+"macro_economy",
+"housing_market"
+)] <- "economy"
+
+master_dataset$topic_group[
+master_dataset$dominant_topic %in% c(
+"kremlin_governance",
+"opinion_discourse",
+"media_society"
+)] <- "politics"
+
+master_dataset$topic_group[
+master_dataset$dominant_topic == "courts_crime"
+] <- "crime"
+
+
+table(master_dataset$topic_group)
+
+
+master_dataset$anti_west_vs_russia <-
+master_dataset$any_anti_west - master_dataset$any_anti_russia
+
+aggregate(anti_west_vs_russia ~ topic_group,
+data = master_dataset,
+mean)
+
+write.csv(
+  master_dataset,
+  "C:/Users/olemga/OneDrive - PRIO/Documents/MA Thesis/Methods/Data/expert_topic_sentiment_master.csv",
+  row.names = FALSE
+)
+master_dataset <- expert_topic_sentiment_master
+
+master_dataset$year <- as.integer(format(as.Date(master_dataset$DateParsed.x), "%Y"))
+
+model1 <- lm(
+anti_west_vs_russia ~
+is_foreign_final +
+topic_group +
+year,
+data = master_dataset
+)
+
+summary(model1)
+
+# ------------------------------------------------------------
+# CLEAN AND STANDARDIZE MASTER DATASET
+# ------------------------------------------------------------
+
+# 1. Standardize variable names
+names(master_dataset) <- tolower(names(master_dataset))
+
+# 2. Create clean date variable and remove merge duplicates
+master_dataset$date <- as.Date(master_dataset$dateparsed.x)
+
+master_dataset$dateparsed.x <- NULL
+master_dataset$dateparsed.y <- NULL
+
+# 3. Create year variable
+master_dataset$year <- as.integer(format(master_dataset$date, "%Y"))
+
+# 4. Rename key variables for clarity
+names(master_dataset)[names(master_dataset) == "sentence"] <- "mention_sentence"
+names(master_dataset)[names(master_dataset) == "country_final"] <- "expert_country"
+names(master_dataset)[names(master_dataset) == "is_foreign_final"] <- "foreign_expert"
+
+# 5. Topic columns
+topic_cols <- c(
+"courts_crime",
+"covid_health",
+"development_education",
+"energy_sanctions",
+"general_news",
+"housing_market",
+"information_services",
+"international_geopolitics",
+"kremlin_governance",
+"macro_economy",
+"media_society",
+"military_technology",
+"opinion_discourse",
+"regions_local",
+"ukraine_war"
+)
+
+# 6. Replace missing topic weights with 0
+master_dataset[topic_cols] <- lapply(master_dataset[topic_cols], function(x) {
+  x[is.na(x)] <- 0
+  x
+})
+
+# 7. Create dominant topic
+master_dataset$dominant_topic <- topic_cols[
+  max.col(master_dataset[topic_cols], ties.method = "first")
+]
+
+# 8. Label rows without topic modelling
+master_dataset$dominant_topic[rowSums(master_dataset[topic_cols]) == 0] <- "no_topic"
+
+# 9. Rename key sentiment variables
+names(master_dataset)[names(master_dataset) == "any_anti_west"] <- "anti_west"
+names(master_dataset)[names(master_dataset) == "any_anti_russia"] <- "anti_russia"
+names(master_dataset)[names(master_dataset) == "any_anti_ukraine"] <- "anti_ukraine"
+
+# 10. Recreate asymmetry index
+master_dataset$anti_west_vs_russia <- master_dataset$anti_west - master_dataset$anti_russia
+
+# 11. Convert important variables to proper types
+master_dataset$foreign_expert <- as.integer(master_dataset$foreign_expert)
+master_dataset$topic_group <- factor(master_dataset$topic_group)
+master_dataset$dominant_topic <- factor(master_dataset$dominant_topic)
+
+# ------------------------------------------------------------
+# DATASET IS NOW CLEAN
+# ------------------------------------------------------------
+
+```
+
+# Analyses:
+
+share of domestic vs. foreign
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+master_dataset %>%
+  count(foreign_expert) %>%
+  mutate(share = n / sum(n)) %>%
+  ggplot(aes(x = factor(foreign_expert, labels = c("Domestic", "Foreign")), y = share)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    title = "Foreign and domestic experts in the corpus"
+  ) +
+  theme_minimal()
+
+ggplot(plot_data, aes(x = year, y = share)) +
+
+  # Light raw line (de-emphasized)
+  geom_line(color = "#2b6cb0", size = 0.6, alpha = 0.4) +
+
+  # Strong smoothed trend
+  geom_smooth(method = "loess",
+              se = FALSE,
+              color = "black",
+              size = 1.2) +
+
+  # Reference line at 50%
+  geom_hline(yintercept = 0.5,
+             linetype = "dotted",
+             color = "grey40") +
+
+  scale_y_continuous(labels = scales::percent,
+                     limits = c(0.3, 0.7)) +
+
+  labs(
+    x = "Year",
+    y = "Share of expert mentions",
+    title = "Share of foreign experts over time",
+    subtitle = "Foreign experts consistently account for roughly half of expert mentions"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+Counts over time
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+
+# Prepare data
+plot_counts <- master_dataset %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(month, foreign_expert) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(type = ifelse(foreign_expert == 1, "Foreign", "Domestic"))
+
+# Get dynamic y-axis max for annotations
+y_max <- max(plot_counts$n, na.rm = TRUE)
+
+# Plot
+ggplot(plot_counts, aes(x = month, y = n, color = type)) +
+
+  # Raw monthly lines (light)
+  geom_line(size = 0.35, alpha = 0.35) +
+
+  # Smoothed trend (low span to preserve dip)
+  geom_smooth(
+    se = FALSE,
+    size = 1.2,
+    span = 0.05
+  ) +
+
+  # Vertical lines for key events
+  geom_vline(xintercept = as.Date("2014-01-01"),
+             linetype = "dashed",
+             color = "grey50",
+             linewidth = 0.5,
+             alpha = 0.7) +
+
+  geom_vline(xintercept = as.Date("2020-03-01"),
+             linetype = "dashed",
+             color = "grey50",
+             linewidth = 0.5,
+             alpha = 0.7) +
+
+  geom_vline(xintercept = as.Date("2022-02-24"),
+             linetype = "dashed",
+             color = "grey50",
+             linewidth = 0.5,
+             alpha = 0.7) +
+
+  # Labels for events
+  annotate("text",
+           x = as.Date("2014-01-01"),
+           y = y_max * 0.95,
+           label = "Editorial change",
+           angle = 90,
+           vjust = -0.4,
+           size = 3,
+           color = "grey30") +
+
+  annotate("text",
+           x = as.Date("2020-03-01"),
+           y = y_max * 0.95,
+           label = "COVID-19",
+           angle = 90,
+           vjust = -0.4,
+           size = 3,
+           color = "grey30") +
+
+  annotate("text",
+           x = as.Date("2022-02-24"),
+           y = y_max * 0.95,
+           label = "Ukraine invasion",
+           angle = 90,
+           vjust = -0.4,
+           size = 3,
+           color = "grey30") +
+
+  # Colors
+  scale_color_manual(
+    values = c(
+      "Domestic" = "#b04a4a",   # muted red
+      "Foreign"  = "#2b6cb0"    # blue
+    )
+  ) +
+
+  # Axis formatting
+  scale_y_continuous(labels = comma) +
+
+  # Labels
+  labs(
+    x = NULL,
+    y = "Number of expert mentions",
+    color = NULL,
+    title = "Number of foreign and domestic expert mentions over time",
+    subtitle = "Monthly counts with smoothed trends"
+  ) +
+
+  # Theme
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+Sentiment by target actor
+
+```{r}
+master_dataset %>%
+  summarise(
+    anti_russia = mean(anti_russia, na.rm = TRUE),
+    anti_west = mean(anti_west, na.rm = TRUE),
+    anti_ukraine = mean(anti_ukraine, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(everything(), names_to = "target", values_to = "rate") %>%
+  ggplot(aes(x = target, y = rate)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    title = "Negative sentiment by target actor"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+Foreign vs domestic experts by target sentiment
+
+```{r}
+master_dataset %>%
+  group_by(foreign_expert) %>%
+  summarise(
+    anti_russia = mean(anti_russia, na.rm = TRUE),
+    anti_west = mean(anti_west, na.rm = TRUE),
+    anti_ukraine = mean(anti_ukraine, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(anti_russia, anti_west, anti_ukraine),
+    names_to = "target",
+    values_to = "rate"
+  ) %>%
+  ggplot(aes(x = target, y = rate, fill = factor(foreign_expert, labels = c("Domestic", "Foreign")))) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    fill = NULL,
+    title = "Negative sentiment by expert nationality"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+plot_sentiment <- master_dataset %>%
+  group_by(foreign_expert) %>%
+  summarise(
+    Russia = mean(anti_russia, na.rm = TRUE),
+    Ukraine = mean(anti_ukraine, na.rm = TRUE),
+    West = mean(anti_west, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = c(Russia, Ukraine, West),
+    names_to = "Target",
+    values_to = "Rate"
+  ) %>%
+  mutate(
+    Expert = factor(foreign_expert,
+                    levels = c(0, 1),
+                    labels = c("Domestic", "Foreign")),
+    Target = factor(Target,
+                    levels = c("Russia", "Ukraine", "West"))
+  )
+
+ggplot(plot_sentiment,
+       aes(x = Target, y = Rate, fill = Expert)) +
+
+  geom_col(position = position_dodge(width = 0.7),
+           width = 0.6) +
+
+  scale_fill_manual(
+    values = c(
+      "Domestic" = "#b04a4a",
+      "Foreign"  = "#2b6cb0"
+    )
+  ) +
+
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1)
+  ) +
+
+  labs(
+    x = NULL,
+    y = "Share of mentions with negative sentiment",
+    fill = NULL,
+    title = "Negative sentiment by expert nationality",
+    subtitle = "Foreign experts are more likely to express negative sentiment toward Western actors"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+Negative sentiment by topic group
+
+```{r}
+
+master_dataset %>%
+  group_by(topic_group) %>%
+  summarise(
+    anti_russia = mean(anti_russia, na.rm = TRUE),
+    anti_west = mean(anti_west, na.rm = TRUE),
+    anti_ukraine = mean(anti_ukraine, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(anti_russia, anti_west, anti_ukraine),
+    names_to = "target",
+    values_to = "rate"
+  ) %>%
+  ggplot(aes(x = topic_group, y = rate, fill = target)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    fill = "Target",
+    title = "Negative sentiment across issue areas"
+  ) +
+  theme_minimal()
+
+```
+
+Negative sentiment by topic group
+
+```{r}
+
+master_dataset %>%
+  group_by(topic_group) %>%
+  summarise(mean_asymmetry = mean(anti_west_vs_russia, na.rm = TRUE)) %>%
+  ggplot(aes(x = reorder(topic_group, mean_asymmetry), y = mean_asymmetry)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Anti-West minus anti-Russia",
+    title = "Narrative asymmetry by topic group"
+  ) +
+  theme_minimal()
+```
+
+Foreign expert use over time
+
+```{r}
+
+master_dataset %>%
+  group_by(year) %>%
+  summarise(foreign_share = mean(foreign_expert, na.rm = TRUE)) %>%
+  ggplot(aes(x = year, y = foreign_share)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share foreign experts",
+    title = "Foreign expert use over time"
+  ) +
+  theme_minimal()
+```
+
+Anti-West framing over time
+
+```{r}
+
+master_dataset %>%
+  group_by(year) %>%
+  summarise(
+    anti_west = mean(anti_west, na.rm = TRUE),
+    anti_russia = mean(anti_russia, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(anti_west, anti_russia),
+    names_to = "target",
+    values_to = "rate"
+  ) %>%
+  ggplot(aes(x = year, y = rate, color = target)) +
+  geom_line() +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    color = NULL,
+    title = "Negative sentiment toward West and Russia over time"
+  ) +
+  theme_minimal()
+```
+
+Alluvial plot
+
+```{r}
+
+library(dplyr)
+
+master_dataset <- master_dataset %>%
+  mutate(sentiment_category = case_when(
+    anti_west == 1 ~ "Anti-West",
+    anti_russia == 1 ~ "Anti-Russia",
+    anti_ukraine == 1 ~ "Anti-Ukraine",
+    TRUE ~ "Neutral/Other"
+  ))
+
+library(ggalluvial)
+library(ggplot2)
+
+alluvial_data <- master_dataset %>%
+  count(topic_group, foreign_expert, sentiment_category)
+
+ggplot(
+  alluvial_data,
+  aes(
+    axis1 = topic_group,
+    axis2 = factor(foreign_expert, labels = c("Domestic", "Foreign")),
+    axis3 = sentiment_category,
+    y = n
+  )
+) +
+  geom_alluvium(aes(fill = sentiment_category), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey85", color = "grey40") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(limits = c("Topic", "Expert origin", "Sentiment"), expand = c(.05, .05)) +
+  labs(
+    y = "Number of mentions",
+    title = "Topic, expert nationality, and directed sentiment"
+  ) +
+  theme_minimal()
+
+
+
+alluvial_data <- master_dataset %>%
+  filter(sentiment_category != "Neutral/Other") %>%
+  count(topic_group, foreign_expert, sentiment_category)
+
+
+
+ggplot(
+  alluvial_data,
+  aes(
+    axis1 = topic_group,
+    axis2 = factor(foreign_expert, labels = c("Domestic","Foreign")),
+    axis3 = sentiment_category,
+    y = n
+  )
+) +
+  geom_alluvium(aes(fill = sentiment_category), width = 1/12) +
+  geom_stratum(width = 1/12, fill = "grey85", color = "grey40") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_x_discrete(
+    limits = c("Topic","Expert origin","Sentiment"),
+    expand = c(.05,.05)
+  ) +
+  labs(
+    y = "Number of mentions",
+    title = "Directed sentiment in expert commentary"
+  ) +
+  theme_minimal()
+
+
+```
+
+Issue space coordinates
+
+```{r}
+issue_space <- master_dataset %>%
+  group_by(dominant_topic) %>%
+  summarise(
+    foreign_share = mean(foreign_expert),
+    crime = mean(courts_crime),
+    economy = mean(macro_economy + housing_market),
+    geopolitics = mean(ukraine_war + international_geopolitics + military_technology + energy_sanctions),
+    politics = mean(kremlin_governance + opinion_discourse + media_society)
+  ) %>%
+  mutate(
+    x_coord = economy - crime,
+    y_coord = geopolitics - politics
+  )
+
+issue_space <- issue_space %>%
+  filter(dominant_topic != "other")
+
+library(ggrepel)
+
+ggplot(issue_space,
+       aes(x = x_coord,
+           y = y_coord,
+           label = dominant_topic,
+           color = foreign_share)) +
+
+  geom_point(size = 5) +
+  geom_text_repel() +
+
+  scale_color_gradient(
+    low = "steelblue",
+    high = "darkred",
+    name = "Share foreign experts"
+  ) +
+
+  labs(
+    x = "Crime  ←→  Economy",
+    y = "Domestic politics  ←→  Geopolitics",
+    title = "Issue-space map of expert discourse"
+  ) +
+
+  theme_minimal()
+```
+
+```{r}
+library(dplyr)
+
+issue_space <- master_dataset %>%
+  mutate(
+
+    # X dimension: crime vs economy
+    x_coord = (macro_economy + housing_market) - courts_crime,
+
+    # Y dimension: geopolitics vs domestic politics
+    y_coord = (ukraine_war +
+               international_geopolitics +
+               military_technology +
+               energy_sanctions) -
+              (kremlin_governance +
+               opinion_discourse +
+               media_society)
+
+  )
+
+library(ggplot2)
+
+plot_data <- issue_space
+
+ggplot(plot_data,
+       aes(x = x_coord,
+           y = y_coord,
+           color = factor(foreign_expert))) +
+
+  geom_point(alpha = 0.25, size = 1.5) +
+
+  scale_color_manual(
+    values = c("steelblue", "darkred"),
+    labels = c("Domestic", "Foreign"),
+    name = "Expert origin"
+  ) +
+
+  labs(
+    x = "Crime  ←→  Economy",
+    y = "Domestic politics  ←→  Geopolitics",
+    title = "Issue-space map of expert discourse"
+  ) +
+
+  theme_minimal()
+
+ggplot(plot_data,
+       aes(x = x_coord,
+           y = y_coord,
+           color = factor(foreign_expert))) +
+
+  geom_point(alpha = 0.15, size = 1) +
+
+  geom_density_2d() +
+
+  scale_color_manual(
+    values = c("steelblue", "darkred"),
+    labels = c("Domestic", "Foreign"),
+    name = "Expert origin"
+  ) +
+
+  labs(
+    x = "Crime  ←→  Economy",
+    y = "Domestic politics  ←→  Geopolitics",
+    title = "Issue-space distribution of foreign and domestic experts"
+  ) +
+
+  theme_minimal()
+```
+
+Map
+
+```{r}
+
+library(dplyr)
+library(countrycode)
+library(rnaturalearth)
+library(sf)
+library(ggplot2)
+library(scales)
+
+country_counts <- master_dataset %>%
+  filter(!is.na(expert_country_master), expert_country_master != "Unknown") %>%
+  count(expert_country_master) %>%
+  mutate(
+    iso_a3 = countrycode(expert_country_master,
+                         origin = "country.name",
+                         destination = "iso3c"),
+    log_n = log10(n + 1)
+  )
+
+world <- rnaturalearth::ne_countries(scale = "medium",
+                                     returnclass = "sf")
+
+map_data <- world %>%
+  left_join(country_counts, by = c("iso_a3" = "iso_a3"))
+
+ggplot(map_data) +
+  geom_sf(aes(fill = log_n),
+          color = "white",
+          size = 0.1) +
+
+  scale_fill_gradient(
+    low = "#f7fbff",
+    high = "#08306b",
+    na.value = "grey95",
+    breaks = log10(c(1, 10, 100, 1000, 10000)),
+    labels = comma(c(1, 10, 100, 1000, 10000)),
+    name = "Expert mentions"
+  ) +
+
+  labs(
+    title = "Geographic distribution of experts cited in Russian media",
+    subtitle = "Counts of expert mentions by country (log-scaled color)"
+  ) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+```
+
+Top foreign expert countries
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+master_dataset %>%
+  filter(
+    foreign_expert == 1,
+    !is.na(expert_country),
+    expert_country != "Unknown"
+  ) %>%
+  count(expert_country, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(expert_country, n), y = n)) +
+
+  geom_col(fill = "#2b6cb0") +   # same tone as map (blue)
+
+  coord_flip() +
+
+  scale_y_continuous(labels = comma) +
+
+  labs(
+    x = NULL,
+    y = "Number of mentions",
+    title = "Most frequently cited foreign expert countries",
+    subtitle = "Top 15 countries by number of expert mentions"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.major.y = element_blank(),   # cleaner
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 12),
+    legend.position = "none"
+  )
+```
+
+```{r}
+
+master_dataset %>%
+  count(topic_group, foreign_expert) %>%
+  group_by(foreign_expert) %>%
+  mutate(share = n / sum(n)) %>%
+  ggplot(aes(x = topic_group, y = share, fill = factor(foreign_expert, labels = c("Domestic", "Foreign")))) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = "Share of expert mentions",
+    fill = NULL,
+    title = "Issue profile of foreign and domestic experts"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+heatmap_data <- master_dataset %>%
+  group_by(topic_group) %>%
+  summarise(
+    Russia = mean(anti_russia, na.rm = TRUE),
+    West = mean(anti_west, na.rm = TRUE),
+    Ukraine = mean(anti_ukraine, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(cols = c(Russia, West, Ukraine), names_to = "target", values_to = "rate")
+
+ggplot(heatmap_data, aes(x = target, y = topic_group, fill = rate)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Negative rate",
+    title = "Heatmap of negative sentiment by topic and target"
+  ) +
+  theme_minimal()
+
+
+heatmap_data_dom <- master_dataset %>%
+  group_by(master_dataset$dominant_topic) %>%
+  summarise(
+    Russia = mean(anti_russia, na.rm = TRUE),
+    West = mean(anti_west, na.rm = TRUE),
+    Ukraine = mean(anti_ukraine, na.rm = TRUE)
+  ) %>%
+  tidyr::pivot_longer(cols = c(Russia, West, Ukraine), names_to = "target", values_to = "rate")
+
+ggplot(heatmap_data_dom, aes(x = target, y = heatmap_data_dom$`master_dataset$dominant_topic`, fill = rate)) +
+  geom_tile() +
+  scale_fill_viridis_c(labels = scales::percent) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Negative rate",
+    title = "Heatmap of negative sentiment by topic and target"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+heatmap_data <- master_dataset %>%
+  count(topic_group, foreign_expert) %>%
+  group_by(topic_group) %>%
+  mutate(share = n / sum(n))
+
+ggplot(heatmap_data,
+       aes(x = topic_group,
+           y = factor(foreign_expert,
+           labels = c("Domestic","Foreign")),
+           fill = share)) +
+
+  geom_tile() +
+
+  scale_fill_viridis_c(labels = scales::percent) +
+
+  labs(
+    x = "Topic",
+    y = "Expert origin",
+    fill = "Share",
+    title = "Foreign and domestic experts across issue areas"
+  ) +
+
+  theme_minimal()
+```
+
+# Topic modelling for Tore
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+
+topic_cols <- c(
+"courts_crime",
+"covid_health",
+"development_education",
+"energy_sanctions",
+"general_news",
+"housing_market",
+"information_services",
+"international_geopolitics",
+"kremlin_governance",
+"macro_economy",
+"media_society",
+"military_technology",
+"opinion_discourse",
+"regions_local",
+"ukraine_war"
+)
+
+topic_distribution <- master_dataset %>%
+  summarise(across(all_of(topic_cols), mean)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "topic",
+    values_to = "share"
+  ) %>%
+  mutate(
+    topic = str_replace_all(topic, "_", " "),
+    topic = str_to_title(topic),
+    percent = share * 100
+  ) %>%
+  arrange(desc(percent))
+
+ggplot(topic_distribution,
+       aes(x = reorder(topic, percent),
+           y = percent)) +
+  geom_col(fill = "#4C78A8", width = 0.7) +
+  coord_flip() +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, .08)),
+    labels = label_percent(scale = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Average topic share (%)",
+    title = "Topic prevalence in the news corpus"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11)
+  )
+
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(scales)
+
+topic_cols <- c(
+"courts_crime",
+"covid_health",
+"development_education",
+"energy_sanctions",
+"general_news",
+"housing_market",
+"information_services",
+"international_geopolitics",
+"kremlin_governance",
+"macro_economy",
+"media_society",
+"military_technology",
+"opinion_discourse",
+"regions_local",
+"ukraine_war"
+)
+
+topic_distribution <- master_dataset %>%
+  summarise(across(all_of(topic_cols), mean)) %>%
+  pivot_longer(
+    everything(),
+    names_to = "topic",
+    values_to = "share"
+  ) %>%
+  mutate(
+    
+    topic = str_replace_all(topic, "_", " "),
+    topic = str_to_title(topic),
+    
+    percent = share * 100,
+    
+    group = case_when(
+      topic %in% c("Macro Economy","Housing Market","Energy Sanctions") ~ "Economic policy",
+      
+      topic %in% c("Kremlin Governance","Courts Crime","Regions Local") ~ "Domestic politics",
+      
+      topic %in% c("Ukraine War","Military Technology","International Geopolitics") ~ "International politics",
+      
+      topic %in% c("Covid Health","Media Society","Opinion Discourse",
+                   "General News","Development Education","Information Services") ~ "Society and information"
+    )
+    
+  ) %>%
+  arrange(desc(percent))
+
+ggplot(topic_distribution,
+       aes(x = reorder(topic, percent),
+           y = percent,
+           fill = group)) +
+  
+  geom_col(width = 0.7) +
+  
+  coord_flip() +
+  
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    hjust = -0.1,
+    size = 3.5
+  ) +
+  
+  scale_fill_manual(values = c(
+    "Economic policy" = "#4C78A8",
+    "Domestic politics" = "#F58518",
+    "International politics" = "#54A24B",
+    "Society and information" = "#B279A2"
+  )) +
+  
+  scale_y_continuous(
+    expand = expansion(mult = c(0, .08)),
+    labels = label_percent(scale = 1)
+  ) +
+  
+  labs(
+    x = NULL,
+    y = "Average topic share (%)",
+    fill = "Topic category",
+    title = "Topic prevalence in the Lenta.ru news corpus"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+
+topic_map <- data.frame(
+topic = topic_cols,
+group = c(
+"crime",
+"other",
+"economy",
+"geopolitics",
+"other",
+"economy",
+"other",
+"geopolitics",
+"politics",
+"economy",
+"politics",
+"geopolitics",
+"politics",
+"other",
+"geopolitics"
+))
+
+topic_group_dist <- topic_distribution %>%
+  left_join(topic_map)
+
+ggplot(topic_group_dist,
+       aes(x=group,
+           y=share,
+           fill=topic)) +
+  geom_col() +
+  labs(
+    x="Topic group",
+    y="Average topic weight",
+    title="Aggregation of topics into issue groups"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+topic_time <- master_dataset %>%
+  group_by(year) %>%
+  summarise(across(all_of(topic_cols), mean)) %>%
+  pivot_longer(-year,
+               names_to="topic",
+               values_to="share")
+
+ggplot(topic_time,
+       aes(x=year,
+           y=share,
+           color=topic)) +
+  geom_line() +
+  labs(
+    x=NULL,
+    y="Average topic weight",
+    title="Topic prevalence over time"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+library(treemapify)
+
+topic_sizes <- topic_distribution %>%
+  left_join(topic_map)
+
+ggplot(topic_sizes,
+       aes(area=share,
+           fill=group,
+           label=topic)) +
+  geom_treemap() +
+  geom_treemap_text(
+    colour="white",
+    place="centre",
+    grow=TRUE
+  ) +
+  labs(
+    title="Topic composition of the corpus"
+  ) +
+  theme_minimal()
+
+ggplot(topic_sizes,
+       aes(area=share,
+           fill=group,
+           label=paste0(topic,"\n",round(share*100,1),"%"))) +
+
+  geom_treemap(color="white") +
+  geom_treemap_text(
+    colour="white",
+    place="centre",
+    reflow=TRUE
+  ) +
+
+  scale_fill_brewer(palette="Set2") +
+
+  labs(
+    title="Topic composition of the corpus",
+    fill="Topic group"
+  ) +
+
+  theme_minimal()
+```
+
+```{r}
+
+master_dataset %>%
+  count(dominant_topic) %>%
+  ggplot(aes(x=reorder(dominant_topic,n), y=n)) +
+  geom_col(fill="darkred") +
+  coord_flip() +
+  labs(
+    x=NULL,
+    y="Expert mentions",
+    title="Distribution of expert mentions across topics"
+  ) +
+  theme_minimal()
+```
+
+# Directed sentiment for Tore:
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+sentiment_dist <- master_dataset %>%
+  summarise(
+    anti_russia = sum(anti_russia),
+    anti_west = sum(anti_west),
+    anti_ukraine = sum(anti_ukraine)
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to="target",
+    values_to="count"
+  )
+
+ggplot(sentiment_dist,
+       aes(x=target, y=count)) +
+  geom_col(fill="steelblue") +
+  labs(
+    x=NULL,
+    y="Number of mentions",
+    title="Directed negative sentiment by target actor"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+sentiment_compare <- master_dataset %>%
+  summarise(
+    Russia = mean(anti_russia),
+    West = mean(anti_west),
+    Ukraine = mean(anti_ukraine)
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to="target",
+    values_to="rate"
+  )
+
+ggplot(sentiment_compare,
+       aes(x=target, y=rate)) +
+  geom_col(fill="darkred") +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x=NULL,
+    y="Share of mentions",
+    title="Directed sentiment assigns negativity to specific actors"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+sentiment_categories <- master_dataset %>%
+  mutate(sentiment_category = case_when(
+    anti_west == 1 ~ "Anti-West",
+    anti_russia == 1 ~ "Anti-Russia",
+    anti_ukraine == 1 ~ "Anti-Ukraine",
+    TRUE ~ "Neutral"
+  )) %>%
+  count(sentiment_category)
+
+ggplot(sentiment_categories,
+       aes(x=reorder(sentiment_category, n), y=n)) +
+  geom_col(fill="grey50") +
+  coord_flip() +
+  labs(
+    x=NULL,
+    y="Number of sentences",
+    title="Distribution of directed sentiment categories"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+targets <- master_dataset %>%
+  summarise(
+    Russia=sum(any_negative_russia),
+    West=sum(any_negative_west),
+    Ukraine=sum(any_negative_ukraine)
+  ) %>%
+  tidyr::pivot_longer(
+    everything(),
+    names_to="target",
+    values_to="mentions"
+  )
+
+ggplot(targets,
+       aes(x=target, y=mentions)) +
+  geom_col(fill="firebrick") +
+  labs(
+    x=NULL,
+    y="Mentions",
+    title="Targets detected in directed sentiment analysis"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+master_dataset %>%
+  filter(anti_west == 1) %>%
+  select(mention_sentence) %>%
+  slice_sample(n=5)
+```
+
+```{r}
+
+library(DiagrammeR)
+
+grViz("
+digraph pipeline {
+
+graph [layout = dot]
+
+node [shape = box]
+
+A [label='News Articles']
+B [label='Topic Modelling']
+C [label='Expert Extraction']
+D [label='Directed Sentiment']
+E [label='Final Dataset']
+
+A -> B -> C -> D -> E
+
+}
+")
+
+```
+
+```{r}
+
+library(broom)
+library(ggplot2)
+
+model <- glm(
+  anti_west ~ foreign_expert + topic_group + year,
+  data = master_dataset,
+  family = binomial
+)
+
+coef_data <- broom::tidy(model, conf.int = TRUE)
+
+coef_data <- coef_data %>%
+  filter(term != "(Intercept)")
+
+ggplot(coef_data,
+       aes(x = estimate,
+           y = reorder(term, estimate))) +
+
+  geom_point(size = 3) +
+
+  geom_errorbarh(
+    aes(xmin = conf.low,
+        xmax = conf.high),
+    height = .2
+  ) +
+
+  geom_vline(xintercept = 0,
+             linetype = "dashed") +
+
+  labs(
+    x = "Coefficient estimate",
+    y = NULL,
+    title = "Factors associated with anti-West sentiment"
+  ) +
+
+  theme_minimal()
+
+
+```
+
+```{r}
+
+library(ggeffects)
+
+pred <- ggpredict(model, terms = "foreign_expert")
+
+plot(pred) +
+  labs(
+    x = "Foreign expert",
+    y = "Predicted probability of anti-West sentiment",
+    title = "Effect of foreign experts on anti-West sentiment"
+  )
+
+pred_topic <- ggpredict(model,
+                        terms = c("topic_group","foreign_expert"))
+
+plot(pred_topic) +
+  labs(
+    x = "Topic group",
+    y = "Predicted probability",
+    title = "Anti-West sentiment across topics and expert origin"
+  )
+
+pred_topic <- ggpredict(model,
+                        terms = c("topic_group","foreign_expert"))
+
+plot(pred_topic) +
+  labs(
+    x = "Topic group",
+    y = "Predicted probability",
+    title = "Anti-West sentiment across topics and expert origin"
+  )
+```
+
+```{r}
+
+model1 <- glm(
+  anti_west ~ foreign_expert,
+  data = master_dataset,
+  family = binomial
+)
+
+library(ggeffects)
+
+plot(ggpredict(model1, terms = "foreign_expert")) +
+  labs(
+    x = "Foreign expert",
+    y = "Predicted probability",
+    title = "Foreign experts and anti-West sentiment"
+  )
+
+```
+
+```{r}
+
+model2 <- glm(
+  anti_west ~ foreign_expert + topic_group,
+  data = master_dataset,
+  family = binomial
+)
+
+library(broom)
+
+coef2 <- tidy(model2, conf.int = TRUE)
+
+ggplot(coef2 %>% filter(term != "(Intercept)"),
+       aes(x = estimate, y = reorder(term, estimate))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height=.2) +
+  geom_vline(xintercept = 0, linetype="dashed") +
+  theme_minimal() +
+  labs(
+    x="Coefficient",
+    y=NULL,
+    title="Topic effects on anti-West sentiment"
+  )
+
+```
+
+```{r}
+
+model3 <- glm(
+  anti_west ~ foreign_expert * topic_group,
+  data = master_dataset,
+  family = binomial
+)
+
+plot(ggpredict(model3, terms = c("topic_group","foreign_expert"))) +
+  labs(
+    x="Topic group",
+    y="Predicted probability",
+    title="Foreign experts across issue areas"
+  )
+```
+
+```{r}
+
+model4 <- lm(
+  anti_west_vs_russia ~ foreign_expert + topic_group + year,
+  data = master_dataset
+)
+
+coef4 <- tidy(model4, conf.int = TRUE)
+
+ggplot(coef4 %>% filter(term!="(Intercept)"),
+       aes(x=estimate, y=reorder(term,estimate))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin=conf.low, xmax=conf.high), height=.2) +
+  geom_vline(xintercept=0, linetype="dashed") +
+  theme_minimal() +
+  labs(
+    title="Drivers of narrative asymmetry"
+  )
+```
+
+```{r}
+
+model5 <- glm(
+  anti_russia ~ foreign_expert + topic_group + year,
+  data = master_dataset,
+  family = binomial
+)
+
+model5
+```
+
+```{r}
+
+model6 <- glm(
+  anti_west ~ foreign_expert + topic_group + year,
+  data = master_dataset,
+  family = binomial
+)
+
+
+plot(ggpredict(model6, terms="year")) +
+  labs(
+    y="Predicted probability",
+    title="Anti-West sentiment over time"
+  )
+```
+
+```{r}
+
+model_topic <- glm(
+  anti_west ~ foreign_expert + dominant_topic + year,
+  data = master_dataset,
+  family = binomial
+)
+
+library(broom)
+library(dplyr)
+
+coef_topic <- tidy(model_topic, conf.int = TRUE) %>%
+  filter(term != "(Intercept)")
+
+
+coef_topic <- coef_topic %>%
+  mutate(
+    term = gsub("dominant_topic", "", term),
+    term = gsub("_", " ", term)
+  )
+
+library(ggplot2)
+
+ggplot(coef_topic,
+       aes(x = estimate,
+           y = reorder(term, estimate))) +
+
+  geom_point(size = 3) +
+
+  geom_errorbarh(
+    aes(xmin = conf.low,
+        xmax = conf.high),
+    height = .2
+  ) +
+
+  geom_vline(xintercept = 0,
+             linetype = "dashed",
+             color = "grey40") +
+
+  labs(
+    x = "Coefficient estimate",
+    y = NULL,
+    title = "Anti-West sentiment across dominant topics"
+  ) +
+
+  theme_minimal()
+
+
+coef_topic <- coef_topic %>%
+  filter(grepl("topic", term))
+
+library(ggeffects)
+
+pred_topic <- ggpredict(
+  model_topic,
+  terms = "dominant_topic"
+)
+
+plot(pred_topic) +
+  labs(
+    x = "Dominant topic",
+    y = "Predicted probability of anti-West sentiment",
+    title = "Anti-West sentiment by topic"
+  )
+```
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+target_data <- master_dataset %>%
+  mutate(
+    target = case_when(
+      any_positive_russia == 1 | any_negative_russia == 1 | any_neutral_russia == 1 ~ "Russia",
+      any_positive_west == 1 | any_negative_west == 1 | any_neutral_west == 1 ~ "West",
+      any_positive_ukraine == 1 | any_negative_ukraine == 1 | any_neutral_ukraine == 1 ~ "Ukraine",
+      TRUE ~ "Other actors / non-target"
+    )
+  )
+
+counts <- target_data %>%
+  count(target)
+
+detected <- counts %>%
+  filter(target != "Other actors / non-target") %>%
+  mutate(group = "Detected targets")
+
+other <- counts %>%
+  filter(target == "Other actors / non-target") %>%
+  mutate(group = "Other actors / non-target")
+
+plot_data <- bind_rows(detected, other)
+
+ggplot(plot_data,
+       aes(x = group,
+           y = n,
+           fill = target)) +
+  
+  geom_col(width = 0.6) +
+  
+ scale_fill_manual(values = c(
+  "Russia" = "#4E79A7",
+  "West" = "#76B7B2",
+  "Ukraine" = "#F28E2B",
+  "Other actors / non-target" = "#D3D3D3"
+)) +
+  
+  labs(
+    x = NULL,
+    y = "Number of expert mention sentences",
+    fill = "Target actor",
+    title = "Detection of geopolitical targets in expert commentary"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+sentiment_data <- master_dataset %>%
+  summarise(
+    Russia_Positive = sum(any_positive_russia),
+    Russia_Neutral  = sum(any_neutral_russia),
+    Russia_Negative = sum(any_negative_russia),
+    
+    West_Positive   = sum(any_positive_west),
+    West_Neutral    = sum(any_neutral_west),
+    West_Negative   = sum(any_negative_west),
+    
+    Ukraine_Positive = sum(any_positive_ukraine),
+    Ukraine_Neutral  = sum(any_neutral_ukraine),
+    Ukraine_Negative = sum(any_negative_ukraine)
+  ) %>%
+  pivot_longer(everything()) %>%
+  separate(name, into = c("target","sentiment"), sep = "_")
+
+ggplot(sentiment_data,
+       aes(x = target,
+           y = value,
+           fill = sentiment)) +
+  
+  geom_col(position = position_dodge(width = 0.7),
+           width = 0.6) +
+  
+  scale_fill_manual(values = c(
+    "Positive" = "#4C78A8",
+    "Neutral"  = "#D9D9D9",
+    "Negative" = "#7F7F7F"
+  )) +
+  
+  labs(
+    x = "Target actor",
+    y = "Number of expert mention sentences",
+    fill = "Sentiment",
+    title = "Sentiment classification across detected geopolitical targets"
+  ) +
+  
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.title = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+```
+
+# Plots for writing:
+
+## H1: Foreign expert + topic
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(ggeffects)
+library(scales)
+
+# Create clean topic names (without modifying original variable)
+master_dataset <- master_dataset %>%
+  mutate(
+    dominant_topic_clean = recode(dominant_topic,
+      "ukraine_war" = "Ukraine war",
+      "international_geopolitics" = "International geopolitics",
+      "media_society" = "Media and society",
+      "no_topic" = "Other / no clear topic",
+      "military_technology" = "Military technology",
+      "general_news" = "General news reporting",
+      "energy_sanctions" = "Energy and sanctions",
+      "opinion_discourse" = "Opinion and commentary",
+      "macro_economy" = "Macroeconomy",
+      "courts_crime" = "Courts and crime",
+      "kremlin_governance" = "Kremlin governance",
+      "covid_health" = "COVID-19 and health",
+      "information_services" = "Information services",
+      "housing_market" = "Housing market",
+      "regions_local" = "Regional and local issues",
+      "development_education" = "Development and education"
+    )
+  )
+library(dplyr)
+library(ggplot2)
+library(ggeffects)
+library(scales)
+
+# Ensure dominant_topic is a factor and set reference category
+master_dataset$dominant_topic_clean <- factor(master_dataset$dominant_topic_clean)
+
+# OPTIONAL: change reference to a meaningful baseline if you have one
+# Example:
+# master_dataset$dominant_topic <- relevel(master_dataset$dominant_topic, ref = "Domestic politics")
+
+# Run model
+model_h1 <- glm(
+  foreign_expert ~ dominant_topic_clean + year,
+  data = master_dataset,
+  family = binomial
+)
+
+# Get predicted probabilities
+pred_topic <- ggpredict(model_h1, terms = "dominant_topic_clean")
+
+pred_df <- as.data.frame(pred_topic)
+
+# Plot
+ggplot(pred_df, aes(x = reorder(x, predicted), y = predicted)) +
+
+  geom_point(size = 3, color = "#2b6cb0") +
+
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    width = 0.2
+  ) +
+
+  coord_flip() +
+
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+
+  labs(
+    x = NULL,
+    y = "Predicted probability of foreign expert",
+    title = "Foreign expert presence across topics"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggeffects)
+library(scales)
+
+# Define geopolitical topics
+geopolitical_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+# Clean topic names and remove no_topic
+master_dataset <- master_dataset %>%
+  mutate(
+    dominant_topic_clean = recode(dominant_topic,
+      "ukraine_war"             = "Ukraine war",
+      "international_geopolitics" = "International geopolitics",
+      "media_society"           = "Media and society",
+      "military_technology"     = "Military technology",
+      "general_news"            = "General news reporting",
+      "energy_sanctions"        = "Energy and sanctions",
+      "opinion_discourse"       = "Opinion and commentary",
+      "macro_economy"           = "Macroeconomy",
+      "courts_crime"            = "Courts and crime",
+      "kremlin_governance"      = "Kremlin governance",
+      "covid_health"            = "COVID-19 and health",
+      "information_services"    = "Information services",
+      "housing_market"          = "Housing market",
+      "regions_local"           = "Regional and local issues",
+      "development_education"   = "Development and education"
+    )
+  ) %>%
+  filter(dominant_topic != "no_topic")
+
+master_dataset$dominant_topic_clean <- factor(master_dataset$dominant_topic_clean)
+
+# Run model
+model_h1 <- glm(
+  foreign_expert ~ dominant_topic_clean + year,
+  data = master_dataset,
+  family = binomial
+)
+
+# Get predicted probabilities
+pred_topic <- ggpredict(model_h1, terms = "dominant_topic_clean")
+pred_df <- as.data.frame(pred_topic)
+
+# Add geopolitical indicator
+pred_df <- pred_df %>%
+  mutate(topic_type = ifelse(x %in% geopolitical_topics,
+                             "Geopolitical", "Domestic / other"))
+
+# Plot
+ggplot(pred_df, aes(x = reorder(x, predicted), y = predicted,
+                    color = topic_type)) +
+  geom_point(size = 4) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    width = 0.2
+  ) +
+  scale_color_manual(
+    values = c("Geopolitical" = "#2b6cb0", "Domestic / other" = "gray"),
+    name = NULL
+  ) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    x = NULL,
+    y = "Predicted probability of foreign expert",
+    title = "Foreign expert presence across topics"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+## Before vs after 2014
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggeffects)
+library(scales)
+
+# Split pre/post 2014
+master_dataset <- master_dataset %>%
+  mutate(
+    period = if_else(year < 2014, "Before 2014", "2014 and after"),
+    period = factor(period, levels = c("Before 2014", "2014 and after"))
+  )
+
+# Model
+model_period <- glm(
+  foreign_expert ~ dominant_topic_clean * period,
+  data = master_dataset,
+  family = binomial
+)
+
+# Predictions
+pred_df <- ggpredict(
+  model_period,
+  terms = c("dominant_topic_clean", "period")
+) %>%
+  as.data.frame() %>%
+  mutate(x = as.character(x))
+
+# Order topics by pre-2014 probabilities
+topic_order <- pred_df %>%
+  filter(group == "Before 2014") %>%
+  arrange(desc(predicted)) %>%
+  pull(x)
+
+pred_df <- pred_df %>%
+  mutate(
+    x = factor(x, levels = rev(topic_order))
+  )
+
+# Wide format for plotting change
+plot_df <- pred_df %>%
+  select(x, group, predicted) %>%
+  tidyr::pivot_wider(
+    names_from = group,
+    values_from = predicted
+  )
+
+# Dumbbell plot
+ggplot(plot_df, aes(y = x)) +
+  
+  geom_segment(
+    aes(
+      x = `2014 and after`,
+      xend = `Before 2014`,
+      yend = x
+    ),
+    color = "grey70",
+    linewidth = 0.8
+  ) +
+  
+  geom_point(
+    aes(x = `Before 2014`),
+    size = 3,
+    color = "#2b6cb0"
+  ) +
+  
+  geom_point(
+    aes(x = `2014 and after`),
+    size = 3,
+    color = "#c53030"
+  ) +
+  
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1)
+  ) +
+  
+  labs(
+    x = "Predicted probability of foreign expert",
+    y = NULL,
+    title = "Change in foreign expert use across topics after the 2014 takeover",
+    subtitle = "Blue = Before 2014   |   Red = 2014 and after"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+
+
+```
+
+```{r}
+# -----------------------------
+# Define geopolitical topics
+# -----------------------------
+geo_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+# -----------------------------
+# Get predictions from model
+# -----------------------------
+pred_df <- ggpredict(
+  model_period,
+  terms = c("dominant_topic_clean", "period")
+) %>%
+  as.data.frame() %>%
+  mutate(
+    x = as.character(x),
+    topic_group = if_else(
+      x %in% geo_topics,
+      "Geopolitical",
+      "Domestic / other"
+    )
+  )
+
+# -----------------------------
+# Wide format + compute change
+# -----------------------------
+plot_df <- pred_df %>%
+  select(x, group, predicted, topic_group) %>%
+  pivot_wider(
+    names_from = group,
+    values_from = predicted
+  ) %>%
+  mutate(change = after_2014 - before_2014)
+
+topic_order <- plot_df %>%
+  arrange(topic_group, change) %>%
+  pull(x)
+
+plot_df <- plot_df %>%
+  mutate(x = factor(x, levels = topic_order))
+
+# -----------------------------
+# Plot
+# -----------------------------
+ggplot(plot_df, aes(y = x)) +
+  
+  geom_segment(
+    aes(
+      x = before_2014,
+      xend = after_2014,
+      yend = x
+    ),
+    arrow = arrow(length = unit(0.06, "inches")),
+    linewidth = 0.7,
+    color = "grey40"
+  ) +
+  
+  geom_point(
+    aes(x = before_2014),
+    shape = 21,
+    fill = "white",
+    color = "black",
+    size = 2.8,
+    stroke = 0.8
+  ) +
+  
+  geom_point(
+    aes(
+      x = after_2014,
+      fill = topic_group
+    ),
+    shape = 21,
+    color = "black",
+    size = 3,
+    stroke = 0.5
+  ) +
+  
+  scale_fill_manual(
+    values = c(
+      "Geopolitical"     = "#2166ac",
+      "Domestic / other" = "#d6604d"
+    ),
+    name = NULL
+  ) +
+  
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.02, 0.08))
+  ) +
+  
+  # Optional: add change labels on the right
+  geom_text(
+    aes(
+      x = after_2014,
+      label = sprintf("%+.0f pp", change * 100)
+    ),
+    hjust = -0.4,
+    vjust = 0.8,
+    size = 3,
+    color = "grey30"
+  ) +
+  geom_hline(
+  yintercept = sum(plot_df$topic_group == "Domestic / other") + 0.5,
+  linetype = "dashed",
+  color = "grey70",
+  linewidth = 0.5
+) +
+  
+  labs(
+    x = "Predicted probability of foreign expert",
+    y = NULL,
+    title = "Foreign expert use before and after the 2014 takeover",
+    subtitle = "Topics sorted by post-takeover change; open circle = before 2014, filled = after 2014",
+    caption = "Predicted probabilities from logistic regression. Blue = geopolitical topics, red = domestic/other."
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    plot.caption  = element_text(color = "grey50", size = 9, hjust = 0),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "top",
+    legend.justification = "left"
+  )
+```
+
+topic before and after 2014 v.2
+
+```{r}
+library(tidyverse)
+library(ggeffects)
+library(scales)
+library(ggplot2)
+
+# -----------------------------
+# Define geopolitical topics
+# -----------------------------
+geo_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+# -----------------------------
+# Get predictions from model
+# -----------------------------
+pred_df <- ggpredict(
+  model_period,
+  terms = c("dominant_topic_clean", "period")
+) %>%
+  as.data.frame() %>%
+  mutate(
+    x = as.character(x),
+    topic_group = if_else(
+      x %in% geo_topics,
+      "Geopolitical",
+      "Domestic / other"
+    )
+  )
+
+# -----------------------------
+# Wide format + compute change
+# -----------------------------
+plot_df <- pred_df %>%
+  select(x, group, predicted, conf.low, conf.high, topic_group) %>%
+  mutate(
+    period = case_when(
+      group == "Before 2014"    ~ "before_2014",
+      group == "2014 and after" ~ "after_2014"
+    )
+  ) %>%
+  select(-group) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = c(predicted, conf.low, conf.high),
+    names_glue = "{.value}_{period}"
+  ) %>%
+  mutate(
+    change = predicted_after_2014 - predicted_before_2014,
+    topic_group = factor(topic_group, levels = c("Geopolitical", "Domestic / other"))
+  )
+
+# -----------------------------
+# Order topics
+# -----------------------------
+topic_order <- plot_df %>%
+  arrange(change) %>%
+  pull(x)
+
+plot_df <- plot_df %>%
+  mutate(x = factor(x, levels = rev(topic_order)))
+
+plot_df <- plot_df %>%
+  mutate(decline = predicted_before_2014 - predicted_after_2014)
+
+# -----------------------------
+# Plot
+# -----------------------------
+ggplot(plot_df, aes(x = change, y = x, fill = topic_group)) +
+  geom_col(width = 0.65, color = "grey25", linewidth = 0.2) +
+  geom_vline(xintercept = 0, linewidth = 0.5, color = "grey35") +
+  geom_text(
+    aes(label = sprintf("%+.0f pp", change * 100)),
+    hjust = if_else(plot_df$change < 0, 1.1, -0.1),
+    size = 3.2,
+    color = "grey20"
+  ) +
+  scale_x_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.12, 0.12))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Geopolitical"     = "#2166ac",
+      "Domestic / other" = "#d6604d"
+    ),
+    name = NULL
+  ) +
+  labs(
+    x = "Post-2014 change in predicted probability of foreign expert use",
+    y = NULL,
+    title = "Foreign expert use contracted mainly outside geopolitical topics after 2014",
+    subtitle = "Bars show post-2014 predicted probability minus pre-2014 predicted probability",
+    caption = "Predicted probabilities from logistic regression with topic-period interactions."
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    plot.caption  = element_text(color = "grey50", size = 9, hjust = 0),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position    = "top",
+    legend.justification = "left"
+  )
+```
+
+```{r}
+library(tidyverse)
+library(ggeffects)
+library(scales)
+library(ggplot2)
+
+# -----------------------------
+# Define geopolitical topics
+# -----------------------------
+geo_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+# -----------------------------
+# Get predictions from model
+# -----------------------------
+pred_df <- ggpredict(
+  model_period,
+  terms = c("dominant_topic_clean", "period")
+) %>%
+  as.data.frame() %>%
+  mutate(
+    topic = as.character(x),
+    period_label = case_when(
+      as.character(group) == "Before 2014"    ~ "Before 2014",
+      as.character(group) == "2014 and after" ~ "2014 and after",
+      TRUE ~ as.character(group)
+    ),
+    topic_group = if_else(
+      topic %in% geo_topics,
+      "Geopolitical",
+      "Domestic / other"
+    ),
+    period_label = factor(
+      period_label,
+      levels = c("Before 2014", "2014 and after")
+    ),
+    topic_group = factor(
+      topic_group,
+      levels = c("Geopolitical", "Domestic / other")
+    )
+  )
+
+# -----------------------------
+# Long format for slopegraph
+# -----------------------------
+slope_df <- plot_df %>%
+  select(
+    x,
+    topic_group,
+    before_2014 = predicted_before_2014,
+    after_2014 = predicted_after_2014,
+    change
+  ) %>%
+  pivot_longer(
+    cols = c(before_2014, after_2014),
+    names_to = "period",
+    values_to = "predicted"
+  ) %>%
+  mutate(
+    period = case_when(
+      period == "before_2014" ~ "1999--2013",
+      period == "after_2014"  ~ "2015--2024"
+    ),
+    period = factor(period, levels = c("1999--2013", "2015--2024")),
+    topic_group = factor(topic_group, levels = c("Geopolitical", "Domestic / other"))
+  )
+
+# Order topics by change within the full sample
+topic_order <- plot_df %>%
+  arrange(change) %>%
+  pull(x)
+
+slope_df <- slope_df %>%
+  mutate(x = factor(x, levels = topic_order))
+
+# -----------------------------
+# Plot: slopegraph
+# -----------------------------
+ggplot(slope_df, aes(x = period, y = predicted, group = x, color = topic_group)) +
+  geom_line(linewidth = 0.7, alpha = 0.75) +
+  geom_point(size = 2.5) +
+  geom_text(
+    data = slope_df %>% filter(period == "1999--2013"),
+    aes(label = x),
+    hjust = 1.05,
+    size = 3,
+    color = "grey25"
+  ) +
+  geom_text(
+    data = slope_df %>% filter(period == "2015--2024"),
+    aes(label = sprintf("%.0f%%", predicted * 100)),
+    hjust = -0.25,
+    size = 3,
+    color = "grey25"
+  ) +
+  facet_wrap(~ topic_group, scales = "free_y") +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.08, 0.12))
+  ) +
+  scale_color_manual(
+    values = c(
+      "Geopolitical"     = "#2166ac",
+      "Domestic / other" = "#d6604d"
+    ),
+    guide = "none"
+  ) +
+  labs(
+    x = NULL,
+    y = "Predicted probability of foreign expert use",
+    title = "Foreign expert use narrowed after the 2014 editorial takeover",
+    subtitle = "Lines connect each topic's predicted probability before and after 2014",
+    caption = "Predicted probabilities from logistic regression with topic-period interactions."
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    plot.caption  = element_text(color = "grey50", size = 9, hjust = 0),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "bold"),
+    plot.margin = margin(5.5, 45, 5.5, 90)
+  )
+```
+
+```{r}
+
+
+master_dataset %>%
+  group_by(dominant_topic) %>%
+  summarise(
+    share_foreign = mean(foreign_expert)
+  ) %>%
+  ggplot(aes(x = reorder(dominant_topic, share_foreign),
+             y = share_foreign)) +
+  geom_col(fill = "#2b6cb0") +
+  coord_flip()
+
+```
+
+## H2: sentiment
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggeffects)
+library(scales)
+
+# Run main model
+model_sentiment <- glm(
+  anti_west ~ foreign_expert + dominant_topic_clean + year,
+  data = master_dataset,
+  family = binomial
+)
+
+# Get predicted probabilities for foreign vs domestic
+pred_expert <- ggpredict(model_sentiment, terms = "foreign_expert")
+
+pred_df <- as.data.frame(pred_expert)
+
+# Clean labels
+pred_df <- pred_df %>%
+  mutate(
+    Expert = factor(x,
+                    levels = c(0, 1),
+                    labels = c("Domestic expert", "Foreign expert"))
+  )
+
+# Plot
+ggplot(pred_df,
+       aes(x = Expert, y = predicted, color = Expert)) +
+
+  geom_point(size = 3) +
+
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    width = 0.15
+  ) +
+
+  scale_color_manual(
+    values = c(
+      "Domestic expert" = "#b04a4a",
+      "Foreign expert"  = "#2b6cb0"
+    )
+  ) +
+
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1)
+  ) +
+
+  labs(
+    x = NULL,
+    y = "Predicted probability of negative sentiment toward the West",
+    title = "Effect of foreign experts on anti-West sentiment"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r}
+
+
+library(dplyr)
+library(ggplot2)
+library(broom)
+
+# Faster models (no topic)
+model_west <- glm(anti_west ~ foreign_expert + year,
+                  data = master_dataset, family = binomial)
+
+model_russia <- glm(anti_russia ~ foreign_expert + year,
+                    data = master_dataset, family = binomial)
+
+model_ukraine <- glm(any_anti_ukraine ~ foreign_expert + year,
+                     data = master_dataset, family = binomial)
+
+# Extract coefficients (fast CI)
+coef_df <- bind_rows(
+  tidy(model_russia) %>% mutate(Target = "Russia"),
+  tidy(model_ukraine) %>% mutate(Target = "Ukraine"),
+  tidy(model_west) %>% mutate(Target = "West")
+) %>%
+  filter(term == "foreign_expert") %>%
+  mutate(
+    conf.low = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    Target = factor(Target, levels = c("Russia", "Ukraine", "West"))
+  )
+
+# Plot
+ggplot(coef_df,
+       aes(x = estimate, y = Target)) +
+
+  geom_point(size = 3, color = "#2b6cb0") +
+
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high),
+    height = 0.2,
+    color = "#2b6cb0"
+  ) +
+
+  geom_vline(xintercept = 0, linetype = "dashed") +
+
+  labs(
+    x = "Effect of foreign expert (log-odds)",
+    y = NULL,
+    title = "Effect of foreign experts on directed sentiment"
+  ) +
+
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(broom)
+
+# Add period variable
+master_dataset <- master_dataset %>%
+  mutate(period = if_else(year < 2014, "Before 2014", "After 2014"))
+
+# Function to run models for one period
+run_models <- function(data, period_label) {
+  model_west    <- glm(anti_west ~ foreign_expert + year,
+                       data = data, family = binomial)
+  model_russia  <- glm(anti_russia ~ foreign_expert + year,
+                       data = data, family = binomial)
+  model_ukraine <- glm(any_anti_ukraine ~ foreign_expert + year,
+                       data = data, family = binomial)
+  
+  bind_rows(
+    tidy(model_russia)  %>% mutate(Target = "Russia"),
+    tidy(model_ukraine) %>% mutate(Target = "Ukraine"),
+    tidy(model_west)    %>% mutate(Target = "West")
+  ) %>%
+    filter(term == "foreign_expert") %>%
+    mutate(period = period_label)
+}
+
+# Run for each period
+coef_df <- bind_rows(
+  run_models(filter(master_dataset, year <  2014), "Before 2014"),
+  run_models(filter(master_dataset, year >= 2014), "After 2014")
+) %>%
+  mutate(
+    conf.low  = estimate - 1.96 * std.error,
+    conf.high = estimate + 1.96 * std.error,
+    Target    = factor(Target, levels = c("Russia", "Ukraine", "West")),
+    period    = factor(period, levels = c("Before 2014", "After 2014"))
+  )
+
+# Plot
+ggplot(coef_df, aes(x = estimate, y = Target, color = period, shape = period)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high),
+    height = 0.2,
+    position = position_dodge(width = 0.4)
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(
+    values = c("Before 2014" = "grey60", "After 2014" = "#2b6cb0"),
+    name = NULL
+  ) +
+  scale_shape_manual(
+    values = c("Before 2014" = 21, "After 2014" = 16),
+    name = NULL
+  ) +
+  labs(
+    x     = "Effect of foreign expert (log-odds)",
+    y     = NULL,
+    title = "Effect of foreign experts on directed sentiment, before and after 2014"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "top")
+```
+
+```{r}
+
+
+set.seed(133)
+
+validation_sample <- final_data_verify[
+  sample(.N,1000) ,
+  .(
+    orig_row_id,
+    text_en,
+    person,
+    mention_country,
+    country_final,
+    mention_country_confidence,
+    mention_Country_source
+  )
+] 
+
+write.csv(
+  validation_sample,
+  "validation_sample.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+getwd()
+```
+
+```{r}
+
+
+library(data.table)
+set.seed(3.14)
+
+# Split upfront
+person_rows <- final_data_verify[!is.na(person)]
+na_rows     <- final_data_verify[is.na(person)]
+
+# Helper: sample up to n rows and tag stratum
+take <- function(dt, n, label) {
+  dt <- copy(dt)
+  dt[, stratum := label]
+  dt[sample(.N, min(.N, n))]
+}
+
+# Build strata
+strata <- list(
+  
+  # Most important: low-confidence by key country
+  take(person_rows[mention_country_confidence == 0 & 
+                   country_final == "Russia"],          150, "conf0_Russia"),
+  
+  take(person_rows[mention_country_confidence == 0 & 
+                   country_final == "Ukraine"],         150, "conf0_Ukraine"),
+  
+  take(person_rows[mention_country_confidence == 0 & 
+                   !country_final %in% c("Russia", "Ukraine", 
+                                         "Unknown", "")], 100, "conf0_other_foreign"),
+  
+  # Medium tier (norp-near / gpe-near)
+  take(person_rows[mention_country_confidence >= 0.55 & 
+                   mention_country_confidence <  0.70], 100, "conf_medium"),
+  
+  # High tier (syntax / org-embedded)
+  take(person_rows[mention_country_confidence >= 0.70 & 
+                   mention_country_confidence <  0.85], 150, "conf_high"),
+  
+  # Very high tier (org exact match)
+  take(person_rows[mention_country_confidence >= 0.85], 100, "conf_very_high"),
+  
+  # NA rows for recall estimation
+  take(na_rows, 250, "na_recall")
+)
+
+# Combine
+validation_sample_strat <- rbindlist(strata)[, .(
+  orig_row_id,
+  text_en,
+  person,
+  mention_country,
+  country_final,
+  mention_country_confidence,
+  mention_country_sources,   # lowercase c — check your column name
+  stratum                   # keep this for per-stratum accuracy reporting
+)]
+
+# Verify stratum sizes (some may be smaller if data is limited)
+validation_sample_strat[, .N, by = stratum]
+
+
+write.csv(
+  validation_sample_strat,
+  "validation_sample_strat.csv",
+  row.names = FALSE,
+  fileEncoding = "UTF-8"
+)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+
+stages <- list(
+  "Raw pipeline\n(pre-filter)" = data.frame(
+    True = c("Non-expert", "Non-expert", "Expert", "Expert"),
+    Predicted = c("Extracted", "Missed", "Extracted", "Missed"),
+    n = c(218, 228, 532, 22),
+    label = c("FP\n218", "TN\n~228", "TP\n532", "FN\n~22"),
+    correct = c(FALSE, TRUE, TRUE, FALSE)
+  ),
+  "After manual\nfiltering" = data.frame(
+    True = c("Non-expert", "Non-expert", "Expert", "Expert"),
+    Predicted = c("Extracted", "Missed", "Extracted", "Missed"),
+    n = c(83, 365, 530, 22),
+    label = c("FP\n~83", "TN\n~365", "TP\n530", "FN\n~22"),
+    correct = c(FALSE, TRUE, TRUE, FALSE)
+  )
+)
+
+precision_vals <- c(
+  "Raw pipeline\n(pre-filter)" = "Precision = 71%  |  Recall ≈ 91%  |  F1 ≈ 81%",
+  "After manual\nfiltering"   = "Precision = 87%  |  Recall ≈ 91%"
+)
+
+plot_data <- bind_rows(
+  lapply(names(stages), function(s) {
+    stages[[s]] %>% mutate(stage = s)
+  })
+) %>%
+  mutate(
+    stage = factor(stage, levels = names(stages)),
+    True = factor(True, levels = c("Non-expert", "Expert")),
+    Predicted = factor(Predicted, levels = c("Extracted", "Missed")),
+    prec_label = precision_vals[as.character(stage)]
+  )
+
+label_data <- plot_data %>%
+  distinct(stage, prec_label) %>%
+  mutate(
+    True = factor("Expert", levels = c("Non-expert", "Expert")),
+    Predicted = factor("Extracted", levels = c("Extracted", "Missed"))
+  )
+
+fig1 <- ggplot(plot_data, aes(x = Predicted, y = True, fill = correct)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(
+    aes(label = label),
+    size = 4.2,
+    fontface = "bold",
+    colour = "white",
+    lineheight = 1.3
+  ) +
+  geom_text(
+    data = label_data,
+    aes(label = prec_label),
+    x = 1.5,
+    y = 0.35,
+    size = 3.0,
+    colour = "grey30",
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~stage, nrow = 1) +
+  scale_fill_manual(
+    values = c("TRUE" = "grey30", "FALSE" = "grey70"),
+    guide = "none"
+  ) +
+  scale_x_discrete(position = "top") +
+  labs(
+    x = "Pipeline output",
+    y = "True classification",
+    title = "Expert extraction performance"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold", size = 11),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10, colour = "grey30"),
+    panel.grid = element_blank(),
+    plot.title = element_text(
+      face = "bold", size = 12, hjust = 0.5, margin = margin(b = 10)
+    ),
+    panel.spacing = unit(2, "lines")
+  )
+
+fig1
+ggsave("fig_cm_precision.pdf", fig1, width = 8, height = 4.5, device = cairo_pdf)
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+fd_data <- data.frame(
+  True = factor(
+    c("Domestic\n(Russian)", "Domestic\n(Russian)",
+      "Foreign\n(Non-Russian)", "Foreign\n(Non-Russian)"),
+    levels = c("Domestic\n(Russian)", "Foreign\n(Non-Russian)")
+  ),
+  Predicted = factor(
+    c("Domestic\n(Russian)", "Foreign\n(Non-Russian)",
+      "Domestic\n(Russian)", "Foreign\n(Non-Russian)"),
+    levels = c("Domestic\n(Russian)", "Foreign\n(Non-Russian)")
+  ),
+  n = c(210, 111, 25, 186),
+  correct = c(TRUE, FALSE, FALSE, TRUE),
+  label = c(
+    "TN\n210\n(65% recall)",
+    "FN\n111\nTopic contamination:\nRussian experts in\nforeign-topic articles",
+    "FP\n25",
+    "TP\n186\n(88% recall)"
+  )
+)
+
+# Summary metrics for annotation
+metrics <- data.frame(
+  x = 1.5,
+  y = c(0.35, 0.20, 0.05),
+  label = c(
+    "Overall accuracy: 74%",
+    "Foreign precision: 63%",
+    "n = 532 valid experts"
+  )
+)
+
+fig2 <- ggplot(fd_data, aes(x = Predicted, y = True, fill = correct)) +
+  geom_tile(colour = "white", linewidth = 1.5) +
+  geom_text(
+    aes(label = label),
+    size = 3.5, fontface = "bold", colour = "white", lineheight = 1.2
+  ) +
+  annotate(
+    "text",
+    x = metrics$x, y = metrics$y,
+    label = metrics$label,
+    size = 3.2, colour = "grey30"
+  ) +
+  scale_fill_manual(
+    values = c("TRUE" = "#2166ac", "FALSE" = "#d73027"),
+    guide = "none"
+  ) +
+  scale_x_discrete(position = "top") +
+  labs(
+    x = "Pipeline classification",
+    y = "True classification",
+    title = "Foreign/domestic classification accuracy"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text = element_text(size = 10),
+    panel.grid = element_blank(),
+    plot.title = element_text(face = "bold", size = 12, hjust = 0.5)
+  )
+
+fig2
+ggsave("fig_cm_fd.pdf", fig2, width = 7, height = 5.5, device = cairo_pdf)
+```
+
+```{r}
+
+library(ggplot2)
+library(dplyr)
+
+cal_data <- data.frame(
+  tier = c(
+    "Corpus-only\n(Russia, conf=0)",
+    "High\n(conf ≥ 0.85)",
+    "Medium\n(conf 0.70–0.84)",
+    "Corpus-only\n(Ukraine, conf=0)",
+    "Low\n(conf 0.55–0.69)",
+    "Corpus-only\n(Other foreign, conf=0)"
+  ),
+  accuracy = c(0.95, 0.81, 0.69, 0.63, 0.69, 0.54),
+  n = c(150, 100, 150, 150, 100, 100),
+  tier_type = c(
+    "Corpus-only", "Explicit signal", "Explicit signal",
+    "Corpus-only", "Explicit signal", "Corpus-only"
+  )
+) %>%
+  mutate(
+    se = sqrt(accuracy * (1 - accuracy) / n),
+    ci_lo = accuracy - 1.96 * se,
+    ci_hi = accuracy + 1.96 * se,
+    tier = factor(tier, levels = tier[order(accuracy)])
+  )
+
+fig3 <- ggplot(cal_data, aes(x = accuracy, y = tier, colour = tier_type)) +
+  geom_vline(xintercept = 0.74, linetype = "dashed",
+             colour = "grey50", linewidth = 0.7) +
+  geom_vline(xintercept = 0.81, linetype = "dashed",
+             colour = "#2166ac", linewidth = 0.7) +
+  geom_errorbarh(
+    aes(xmin = ci_lo, xmax = ci_hi),
+    height = 0.25, linewidth = 0.8
+  ) +
+  geom_point(size = 4) +
+  annotate(
+    "text", x = 0.745, y = 0.5,
+    label = "Overall\n74%",
+    hjust = 0, size = 3, colour = "grey40"
+  ) +
+  annotate(
+    "text", x = 0.815, y = 0.5,
+    label = "Robustness\nthreshold\n81%",
+    hjust = 0, size = 3, colour = "#2166ac"
+  ) +
+  annotate(
+    "text",
+    x = 0.96,
+    y = "Corpus-only\n(Russia, conf=0)",
+    label = "Corpus accumulation\nmore reliable than\nsingle-mention extraction",
+    hjust = 1, size = 2.8, colour = "grey30", fontface = "italic"
+  ) +
+  scale_colour_manual(
+    values = c("Corpus-only" = "#d73027", "Explicit signal" = "#2166ac"),
+    name = "Signal type"
+  ) +
+  scale_x_continuous(
+    limits = c(0.45, 1.0),
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0.5, 1.0, 0.1)
+  ) +
+  labs(
+    x = "FD classification accuracy",
+    y = NULL,
+    title = "Classification accuracy by confidence tier",
+    subtitle = "Error bars show 95% binomial confidence intervals"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold", size = 12),
+    plot.subtitle = element_text(size = 10, colour = "grey40")
+  )
+
+fig3
+
+ggsave("fig_calibration.pdf", fig3, width = 8, height = 5.5, device = cairo_pdf)
+
+```
+
+```{r}
+
+library(ggplot2)
+library(tidyverse)
+
+# Confusion matrix values
+cm_data <- tibble(
+  Predicted = factor(c("Expert", "Expert", "No expert", "No expert"),
+                     levels = c("Expert", "No expert")),
+  Actual    = factor(c("Expert", "No expert", "Expert", "No expert"),
+                     levels = c("Expert", "No expert")),
+  n         = c(695, 55, 16, 234),
+  label     = c("TP = 695", "FP = 55", "FN = 16", "TN = 234")
+)
+
+# Precision, recall, F1 for subtitle
+precision <- 695 / (695 + 55)
+recall    <- 695 / (695 + 16)
+f1        <- 2 * precision * recall / (precision + recall)
+
+subtitle_text <- sprintf(
+  "Precision = %.1f%%   Recall = %.1f%%   F1 = %.3f",
+  precision * 100, recall * 100, f1
+)
+
+ggplot(cm_data, aes(x = Predicted, y = Actual, fill = n)) +
+  geom_tile(colour = "white", linewidth = 1.2) +
+  geom_text(aes(label = label), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "grey30",
+                      name = "Count") +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Expert extraction: confusion matrix",
+    subtitle = subtitle_text,
+    x        = "Predicted",
+    y        = "Actual"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+    axis.text     = element_text(size = 12),
+     legend.position = "none",
+    panel.grid    = element_blank()
+  )
+
+ggsave("plot1_person_confusion_matrix.png", width = 6, height = 4.5)
+
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+
+plot_data <- tribble(
+  ~stratum,             ~tier_label,               ~person_acc, ~country_acc, ~fd_acc, ~n_confirmed,
+  "conf0_Russia",       "conf = 0\n(Russia)",       94.0,        50.0,         50.0,    6,
+  "conf0_Ukraine",      "conf = 0\n(Ukraine)",      94.0,         3.6,          4.5,    56,
+  "conf0_other",        "conf = 0\n(other)",        87.0,         0.0,          0.0,    19,
+  "conf_medium",        "conf 0.55-0.70\n(medium)", 92.0,        88.0,         90.0,    92,
+  "conf_high",          "conf 0.70-0.85\n(high)",   93.3,        86.4,         89.6,   140,
+  "conf_very_high",     "conf >= 0.85\n(very high)",94.0,        86.2,         90.0,    94,
+)
+
+plot_long <- plot_data %>%
+  pivot_longer(cols = c(person_acc, country_acc, fd_acc),
+               names_to  = "metric",
+               values_to = "accuracy") %>%
+  mutate(
+    metric = recode(metric,
+                    "person_acc"  = "Person extraction",
+                    "country_acc" = "Country attribution",
+                    "fd_acc"      = "Foreign / domestic"),
+    metric = factor(metric, levels = c("Person extraction",
+                                       "Country attribution",
+                                       "Foreign / domestic")),
+    low_n      = n_confirmed < 30,
+    tier_label = factor(tier_label, levels = plot_data$tier_label)
+  )
+
+solid_data  <- plot_long %>% filter(!low_n)
+dotted_data <- plot_long %>% filter(low_n)
+
+ggplot(plot_long, aes(x = tier_label, y = accuracy,
+                      colour = metric, group = metric)) +
+  geom_line(data = solid_data,  linewidth = 0.8, linetype = "solid") +
+  geom_line(data = dotted_data, linewidth = 0.8, linetype = "dotted") +
+  geom_point(aes(shape = low_n), size = 3.5, fill = "white", stroke = 1.2) +
+  geom_hline(yintercept = 85, linetype = "dashed",
+             colour = "grey50", linewidth = 0.5) +
+  annotate("text", x = 5.8, y = 87,
+           label = "85%", size = 3.2, colour = "grey50") +
+  scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 21),
+                     guide = "none") +
+  scale_colour_manual(values = c("Person extraction"  = "#1a5276",
+                                 "Country attribution" = "#c0392b",
+                                 "Foreign / domestic"  = "#1e8449"),
+                      name = NULL) +
+  scale_y_continuous(limits = c(0, 100),
+                     breaks = seq(0, 100, 20),
+                     labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Validation accuracy by confidence tier",
+    subtitle = "Open points indicate fewer than 30 confirmed cases (high uncertainty)",
+    x        = NULL,
+    y        = "Accuracy (confirmed cases only)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(hjust = 0.5, colour = "grey40", size = 9),
+    legend.position    = "bottom",
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(size = 9)
+  )
+
+ggsave("plot2_accuracy_by_confidence.pdf", width = 8, height = 5)
+```
+
+```{r}
+
+library(ggplot2)
+library(tidyverse)
+
+# ── shared data ────────────────────────────────────────────────────────────────
+
+all_data <- tribble(
+  ~tier_label,                ~low_n, ~metric,              ~accuracy,
+  "conf = 0\n(Russia)",       TRUE,   "Person extraction",   94.0,
+  "conf = 0\n(Russia)",       TRUE,   "Country attribution", 50.0,
+  "conf = 0\n(Russia)",       TRUE,   "Foreign / domestic",  50.0,
+  "conf = 0\n(Ukraine)",      FALSE,  "Person extraction",   94.0,
+  "conf = 0\n(Ukraine)",      FALSE,  "Country attribution",  3.6,
+  "conf = 0\n(Ukraine)",      FALSE,  "Foreign / domestic",   4.5,
+  "conf = 0\n(other)",        FALSE,  "Person extraction",   87.0,
+  "conf = 0\n(other)",        FALSE,  "Country attribution",  0.0,
+  "conf = 0\n(other)",        FALSE,  "Foreign / domestic",   0.0,
+  "conf 0.55-0.70\n(medium)", FALSE,  "Person extraction",   92.0,
+  "conf 0.55-0.70\n(medium)", FALSE,  "Country attribution", 88.0,
+  "conf 0.55-0.70\n(medium)", FALSE,  "Foreign / domestic",  90.0,
+  "conf 0.70-0.85\n(high)",   FALSE,  "Person extraction",   93.3,
+  "conf 0.70-0.85\n(high)",   FALSE,  "Country attribution", 86.4,
+  "conf 0.70-0.85\n(high)",   FALSE,  "Foreign / domestic",  89.6,
+  "conf >= 0.85\n(very high)",FALSE,  "Person extraction",   94.0,
+  "conf >= 0.85\n(very high)",FALSE,  "Country attribution", 86.2,
+  "conf >= 0.85\n(very high)",FALSE,  "Foreign / domestic",  90.0,
+) %>%
+  mutate(
+    metric     = factor(metric, levels = c("Person extraction",
+                                           "Country attribution",
+                                           "Foreign / domestic")),
+    tier_label = factor(tier_label, levels = unique(tier_label))
+  )
+
+high_data <- all_data %>%
+  filter(!str_detect(tier_label, "conf = 0")) %>%
+  mutate(tier_label = factor(tier_label,
+                             levels = c("conf 0.55-0.70\n(medium)",
+                                        "conf 0.70-0.85\n(high)",
+                                        "conf >= 0.85\n(very high)")))
+
+colours <- c("Person extraction"  = "#1a5276",
+             "Country attribution"= "#c0392b",
+             "Foreign / domestic" = "#1e8449")
+
+# ── Option B: dot plot, all tiers ─────────────────────────────────────────────
+
+plotB <- ggplot(all_data,
+                aes(x = accuracy, y = tier_label, colour = metric, shape = low_n)) +
+  geom_vline(xintercept = 85, linetype = "dashed",
+             colour = "grey60", linewidth = 0.5) +
+  annotate("text", x = 86, y = 0.55, label = "85%",
+           size = 3, colour = "grey50", hjust = 0) +
+  geom_point(size = 4, stroke = 1.1,
+             position = position_dodge(width = 0.4)) +
+  scale_shape_manual(values = c(`TRUE` = 1, `FALSE` = 16),
+                     labels = c(`TRUE`  = "Fewer than 30 confirmed cases",
+                                `FALSE` = "30+ confirmed cases"),
+                     name = NULL) +
+  scale_colour_manual(values = colours, name = NULL) +
+  scale_x_continuous(limits = c(0, 100),
+                     breaks = seq(0, 100, 20),
+                     labels = function(x) paste0(x, "%")) +
+  scale_y_discrete(limits = rev) +
+  labs(
+    title    = "Validation accuracy by confidence tier",
+    subtitle = "Hollow points indicate fewer than 30 confirmed cases",
+    x        = "Accuracy (confirmed cases only)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle    = element_text(hjust = 0.5, colour = "grey40", size = 9),
+    legend.position  = "bottom",
+    legend.box       = "vertical",
+    panel.grid.major.y = element_line(colour = "grey92"),
+    panel.grid.major.x = element_line(colour = "grey92"),
+    panel.grid.minor   = element_blank()
+  )
+
+plotB
+
+ggsave("plotB_dot.pdf", plotB, width = 7, height = 5.5)
+
+
+# ── Option C: dot plot, high-confidence tiers only ────────────────────────────
+
+plotC <- ggplot(high_data,
+                aes(x = accuracy, y = tier_label, colour = metric)) +
+  geom_vline(xintercept = 85, linetype = "dashed",
+             colour = "grey60", linewidth = 0.5) +
+  annotate("text", x = 86, y = 0.55, label = "85%",
+           size = 3, colour = "grey50", hjust = 0) +
+  geom_point(size = 4.5,
+             position = position_dodge(width = 0.4)) +
+  geom_text(aes(label = paste0(round(accuracy, 1), "%")),
+            position = position_dodge(width = 0.4),
+            hjust = -0.35, size = 3.2, show.legend = FALSE) +
+  scale_colour_manual(values = colours, name = NULL) +
+  scale_x_continuous(limits = c(75, 100),
+                     breaks = seq(75, 100, 5),
+                     labels = function(x) paste0(x, "%")) +
+  scale_y_discrete(limits = rev) +
+  labs(
+    title    = "Validation accuracy at conf \u2265 0.55",
+    subtitle = "Confirmed cases only. Low-confidence (conf = 0) strata excluded.",
+    x        = "Accuracy",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle      = element_text(hjust = 0.5, colour = "grey40", size = 9),
+    legend.position    = "bottom",
+    panel.grid.major.y = element_line(colour = "grey92"),
+    panel.grid.major.x = element_line(colour = "grey92"),
+    panel.grid.minor   = element_blank()
+  )
+
+plotC
+ggsave("plotC_dot_highconf.pdf", plotC, width = 6.5, height = 4)
+```
+
+```{r}
+final_data_verify %>%
+  mutate(
+    # How was country_final determined?
+    final_tier = case_when(
+      is.na(person)                                      ~ "No extraction",
+      country_final == "Unknown" | country_final == "" | 
+        is.na(country_final)                             ~ "Unknown after overwrite",
+      # Was it overwritten? i.e. mention_country_confidence == 0 
+      # but country_final is not Unknown
+      mention_country_confidence == 0 & 
+        !is.na(country_final) & 
+        country_final != "Unknown"                       ~ "conf = 0 (rescued by majority vote)",
+      mention_country_confidence >= 0.55 & 
+        mention_country_confidence < 0.70                ~ "conf 0.55-0.70",
+      mention_country_confidence >= 0.70 & 
+        mention_country_confidence < 0.85                ~ "conf 0.70-0.85",
+      mention_country_confidence >= 0.85                 ~ "conf >= 0.85",
+      TRUE                                               ~ "other"
+    )
+  ) %>%
+  count(final_tier) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print()
+
+final_data_verify %>%
+  filter(mention_country_confidence == 0 & 
+         !is.na(country_final) & 
+         country_final != "Unknown") %>%
+  count(country_final) %>%
+  mutate(pct = n / sum(n) * 100) %>%
+  arrange(desc(n)) %>%
+  print(n = 20)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+
+# Confusion matrix values
+# Restricted to conf_medium, conf_high, conf_very_high confirmed rows
+# (conf0 strata excluded as they are not in the final analysis dataset)
+cm_data <- tibble(
+  Predicted = factor(c("Foreign", "Foreign", "Domestic", "Domestic"),
+                     levels = c("Foreign", "Domestic")),
+  Actual    = factor(c("Foreign", "Domestic", "Foreign", "Domestic"),
+                     levels = c("Foreign", "Domestic")),
+  n         = c(129, 25, 7, 154),
+  label     = c("TP = 129", "FP = 25", "FN = 7", "TN = 154")
+)
+
+precision <- 129 / (129 + 25)
+recall    <- 129 / (129 + 7)
+f1        <- 2 * precision * recall / (precision + recall)
+accuracy  <- (129 + 154) / (129 + 25 + 7 + 154)
+
+subtitle_text <- sprintf(
+  "Precision = %.1f%%   Recall = %.1f%%   Accuracy = %.1f%%   F1 = %.3f",
+  precision * 100, recall * 100, accuracy * 100, f1
+)
+
+ggplot(cm_data, aes(x = Predicted, y = Actual, fill = n)) +
+  geom_tile(colour = "white", linewidth = 1.2) +
+  geom_text(aes(label = label), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "grey30") +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Foreign/domestic classification: confusion matrix",
+    subtitle = subtitle_text,
+    x        = "Predicted",
+    y        = "Actual"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, colour = "grey40", size = 9),
+    plot.caption  = element_text(colour = "grey50", size = 8, hjust = 0.5),
+    axis.text     = element_text(size = 12),
+    legend.position = "none",
+    panel.grid    = element_blank()
+  )
+
+ggsave("plot3_fd_confusion_matrix.png", width = 6.5, height = 5)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+
+# ── Top 10 foreign experts ────────────────────────────────────────────────────
+top_foreign <- expert_topic_sentiment_master %>%
+  filter(is_foreign_final == TRUE) %>%
+  count(person, country_final, sort = TRUE) %>%
+  slice_head(n = 20) %>%
+  mutate(person = fct_reorder(person, n))
+
+# ── Top 10 domestic experts ───────────────────────────────────────────────────
+top_domestic <- expert_topic_sentiment_master %>%
+  filter(is_foreign_final == FALSE) %>%
+  count(person, country_final, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  mutate(person = fct_reorder(person, n))
+
+# ── Plot foreign ──────────────────────────────────────────────────────────────
+p_foreign <- ggplot(top_foreign,
+                    aes(x = n, y = person, fill = country_final)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = scales::comma(n)),
+            hjust = -0.15, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18)),
+                     labels = scales::comma) +
+  scale_fill_brewer(palette = "Set2", name = "Country") +
+  labs(
+    title    = "Top 10 most cited foreign experts",
+    subtitle = "By total number of mentions in the analysis dataset",
+    x        = "Number of mentions",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0),
+    plot.subtitle   = element_text(colour = "grey40", size = 9, hjust = 0),
+    legend.position = "right",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+p_foreign
+ggsave("plot_top10_foreign.pdf", p_foreign, width = 7, height = 5)
+
+# ── Plot domestic ─────────────────────────────────────────────────────────────
+p_domestic <- ggplot(top_domestic,
+                     aes(x = n, y = person)) +
+  geom_col(width = 0.7, fill = "#2c7bb6") +
+  geom_text(aes(label = scales::comma(n)),
+            hjust = -0.15, size = 3.2) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.18)),
+                     labels = scales::comma) +
+  labs(
+    title    = "Top 10 most cited domestic experts",
+    subtitle = "By total number of mentions in the analysis dataset",
+    x        = "Number of mentions",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0),
+    plot.subtitle      = element_text(colour = "grey40", size = 9, hjust = 0),
+    legend.position    = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+p_domestic
+ggsave("plot_top10_domestic.pdf", p_domestic, width = 7, height = 5)
+```
+
+```{r}
+
+
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Define geopolitical topics
+geo_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+# Prepare data
+topic_counts <- master_dataset %>%
+  filter(dominant_topic_clean != "Other / no clear topic") %>%
+  group_by(dominant_topic_clean) %>%
+  summarise(
+    foreign_expert_count = sum(foreign_expert, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    topic_group = if_else(
+      dominant_topic_clean %in% geo_topics,
+      "Geopolitical",
+      "Other"
+    )
+  ) %>%
+  arrange(desc(foreign_expert_count)) %>%
+  mutate(
+    dominant_topic_clean = factor(
+      dominant_topic_clean,
+      levels = rev(dominant_topic_clean)
+    )
+  )
+
+# Plot
+ggplot(topic_counts, aes(x = foreign_expert_count, y = dominant_topic_clean)) +
+  
+  geom_col(aes(fill = topic_group), width = 0.7) +
+  
+  scale_fill_manual(
+    values = c(
+      "Geopolitical" = "grey20",
+      "Other" = "grey70"
+    ),
+    name = NULL
+  ) +
+  
+  labs(
+    x = "Number of articles with foreign expert",
+    y = NULL,
+    title = "Raw count of foreign expert use across topics"
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+```
+
+## Manual validation subtest
+
+```{r}
+
+set.seed(3.14)  # optional, for reproducibility
+sample_50 <- validation_results[sample(nrow(validation_results), 50), ]
+
+
+write.csv(sample_50, "sample50.csv")
+```
+
+### Expert frequency robustness: h1
+
+```{r}
+library(dplyr)
+library(modelsummary)
+library(kableExtra)
+
+# ── Data preparation ───────────────────────────────────────────────────────
+
+h1_data <- master_dataset %>%
+  filter(dominant_topic_clean != "Other / no clear topic") %>%
+  mutate(
+    dominant_topic_clean = relevel(
+      factor(dominant_topic_clean),
+      ref = "Courts and crime"
+    ),
+    post_2014 = as.integer(year >= 2014),
+    post_2022 = as.integer(year >= 2022)
+  )
+
+h1_data_restricted <- h1_data %>%
+  filter(expert_country_maxconf >= 0.85)
+
+# ── Models ─────────────────────────────────────────────────────────────────
+
+h1_m1 <- glm(foreign_expert ~ dominant_topic_clean,
+             data   = h1_data,
+             family = binomial)
+
+h1_m2 <- glm(foreign_expert ~ dominant_topic_clean + year,
+             data   = h1_data,
+             family = binomial)
+
+h1_m4 <- glm(foreign_expert ~ dominant_topic_clean + year,
+             data   = h1_data_restricted,
+             family = binomial)
+
+h1_m5 <- glm(foreign_expert ~ dominant_topic_clean + post_2014 + post_2022,
+             data   = h1_data,
+             family = binomial)
+
+# ── Coefficient map in block order ─────────────────────────────────────────
+
+coef_map <- c(
+  # Geopolitical block
+  "dominant_topic_cleanInternational geopolitics" = "International geopolitics",
+  "dominant_topic_cleanUkraine war"               = "Ukraine war",
+  "dominant_topic_cleanMilitary technology"       = "Military technology",
+  "dominant_topic_cleanEnergy and sanctions"      = "Energy and sanctions",
+  # Domestic block
+  "dominant_topic_cleanMacroeconomy"              = "Macroeconomy",
+  "dominant_topic_cleanOpinion and commentary"    = "Opinion and commentary",
+  "dominant_topic_cleanInformation services"      = "Information services",
+  "dominant_topic_cleanMedia and society"         = "Media and society",
+  "dominant_topic_cleanKremlin governance"        = "Kremlin governance",
+  "dominant_topic_cleanHousing market"            = "Housing market",
+  "dominant_topic_cleanDevelopment and education" = "Development and education",
+  "dominant_topic_cleanCOVID-19 and health"       = "COVID-19 and health",
+  "dominant_topic_cleanGeneral news"              = "General news",
+  "dominant_topic_cleanRegional and local issues" = "Regional and local issues",
+  # Controls
+  "year"      = "Year (linear)",
+  "post_2014" = "Post-2014",
+  "post_2022" = "Post-2022"
+)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "No controls"              = h1_m1,
+    "+ Year (linear)"          = h1_m2,
+    "Restricted (conf. 0.85+)" = h1_m4,
+    "+ Era indicators"         = h1_m5
+  ),
+  estimate   = "{estimate} ({std.error}){stars}",
+  statistic  = NULL,
+  coef_map   = coef_map,
+  gof_map    = c("nobs", "logLik"),
+  stars      = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title      = "H1: Foreign expert presence across topics",
+  notes      = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic, domestic expert.",
+    "Restricted column uses observations where expert_country_maxconf >= 0.85.",
+    "Era indicators: Post-2014 and Post-2022 are binary variables marking",
+    "the editorial transformation and the full-scale invasion respectively.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output     = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows(
+    "Geopolitical topics",
+    start_row  = 1,
+    end_row    = 4,
+    bold       = TRUE,
+    background = "#e8f0f7"
+  ) %>%
+  pack_rows(
+    "Domestic / other topics",
+    start_row  = 5,
+    end_row    = 14,
+    bold       = TRUE,
+    background = "#f7f0e8"
+  ) %>%
+  pack_rows(
+    "Controls",
+    start_row  = 15,
+    end_row    = 17,
+    bold       = FALSE,
+    background = "#f5f5f5"
+  ) %>%
+  add_header_above(
+    c(" "           = 1,
+      "Main models" = 2,
+      "Robustness"  = 2)
+  ) %>%
+  column_spec(4, background = "#fafafa", italic = TRUE) %>%
+  column_spec(5, background = "#fafafa", italic = TRUE)
+
+
+library(broom)
+
+# Extract tidy results from all three models
+m1_tidy <- tidy(h1_m1) %>% mutate(model = "No controls")
+m2_tidy <- tidy(h1_m2) %>% mutate(model = "+ Year")
+m4_tidy <- tidy(h1_m4) %>% mutate(model = "Robustness")
+
+all_results <- bind_rows(m1_tidy, m2_tidy, m4_tidy) %>%
+  select(model, term, estimate, std.error, p.value)
+
+print(all_results, n = 100)
+
+summary(h1_m2)
+summary(h1_m4)
+
+# ── Mention frequency robustness ───────────────────────────────────────────
+
+# Count unique articles per expert (not raw mentions)
+expert_article_counts <- master_dataset %>%
+  distinct(expert_id, row_id) %>%
+  count(expert_id, name = "n_articles")
+
+# Join back to h1_data
+h1_data <- h1_data %>%
+  left_join(expert_article_counts, by = "expert_id") %>%
+  mutate(
+    inv_freq_weight = 1 / n_articles,
+    freq_bin = case_when(
+      n_articles == 1        ~ "Single mention",
+      n_articles <= 5        ~ "2-5 articles",
+      n_articles <= 20       ~ "6-20 articles",
+      TRUE                   ~ "20+ articles"
+    )
+  )
+
+# Model 1: Restricted to experts appearing in 5 or fewer articles
+h1_data_rare <- h1_data %>% filter(n_articles <= 5)
+
+h1_m_rare <- glm(foreign_expert ~ dominant_topic_clean + year,
+                 data   = h1_data_rare,
+                 family = binomial)
+
+# Model 2: Inverse frequency weighted
+h1_m_weighted <- glm(foreign_expert ~ dominant_topic_clean + year,
+                     data    = h1_data,
+                     family  = binomial,
+                     weights = inv_freq_weight)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main"                     = h1_m2,
+    "Rare experts (≤5 articles)" = h1_m_rare,
+    "Inverse frequency weighted" = h1_m_weighted
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Mention frequency",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "Mention frequency counted as distinct articles per expert_id.",
+    "Rare experts column restricts to experts appearing in 5 or fewer articles.",
+    "Weighted column uses inverse article frequency as observation weight.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",    1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",              15, 15, bold = FALSE, background = "#f5f5f5")
+
+```
+
+### Expert Frequency robustness: H2
+
+```{r}
+library(dplyr)
+library(modelsummary)
+library(kableExtra)
+
+# ── Data preparation ───────────────────────────────────────────────────────
+
+h2_data <- master_dataset %>%
+  filter(dominant_topic_clean != "Other / no clear topic") %>%
+  mutate(
+    topic_block = factor(
+      if_else(topic_group == "geopolitics", "Geopolitical", "Domestic / other"),
+      levels = c("Domestic / other", "Geopolitical")
+    )
+  )
+
+h2_data_restricted <- h2_data %>%
+  filter(expert_country_maxconf >= 0.85)
+
+# ── Models ─────────────────────────────────────────────────────────────────
+
+# Main models
+h2_aw  <- glm(anti_west            ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+h2_au  <- glm(anti_ukraine         ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+h2_puk <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+h2_ar  <- glm(anti_russia          ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+h2_pw  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+h2_pr  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+              data = h2_data, family = binomial)
+
+# Robustness models
+h2_aw_r  <- glm(anti_west            ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+h2_au_r  <- glm(anti_ukraine         ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+h2_puk_r <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+h2_ar_r  <- glm(anti_russia          ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+h2_pw_r  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+h2_pr_r  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+                data = h2_data_restricted, family = binomial)
+
+# ── Raw outcome counts for footer ─────────────────────────────────────────
+
+outcome_counts <- h2_data %>%
+  summarise(
+    aw  = sum(anti_west,            na.rm = TRUE),
+    au  = sum(anti_ukraine,         na.rm = TRUE),
+    puk = sum(any_positive_ukraine, na.rm = TRUE),
+    ar  = sum(anti_russia,          na.rm = TRUE),
+    pw  = sum(any_positive_west,    na.rm = TRUE),
+    pr  = sum(any_positive_russia,  na.rm = TRUE)
+  )
+
+counts_note <- paste0(
+  "Outcome event counts (full sample): ",
+  "Anti-West = ",    outcome_counts$aw,  ", ",
+  "Anti-Ukraine = ", outcome_counts$au,  ", ",
+  "Pro-Ukraine = ",  outcome_counts$puk, ", ",
+  "Anti-Russia = ",  outcome_counts$ar,  ", ",
+  "Pro-West = ",     outcome_counts$pw,  ", ",
+  "Pro-Russia = ",   outcome_counts$pr,  "."
+)
+
+# ── Coefficient map ────────────────────────────────────────────────────────
+
+coef_map <- c(
+  "foreign_expert"          = "Foreign expert",
+  "topic_blockGeopolitical" = "Topic: Geopolitical",
+  "year"                    = "Year"
+)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_r,
+    "Anti-Ukraine" = h2_au_r,
+    "Pro-Ukraine"  = h2_puk_r,
+    "Anti-Russia"  = h2_ar_r,
+    "Pro-West"     = h2_pw_r,
+    "Pro-Russia"   = h2_pr_r
+  ),
+  estimate   = "{estimate} ({std.error}){stars}",
+  statistic  = NULL,
+  coef_map   = coef_map,
+  gof_map    = c("nobs", "logLik"),
+  stars      = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title      = "H2: Foreign expert evaluative profile across sentiment targets",
+  notes      = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Robustness columns restricted to expert_country_maxconf >= 0.85.",
+    counts_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output     = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "                          = 1,
+      "Main models"                = 6,
+      "Robustness (conf. 0.85+)"   = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13, background = "#fafafa", italic = TRUE)
+
+library(broom)
+
+models_main <- list(
+  anti_west    = h2_aw,
+  anti_ukraine = h2_au,
+  pro_ukraine  = h2_puk,
+  anti_russia  = h2_ar,
+  pro_west     = h2_pw,
+  pro_russia   = h2_pr
+)
+
+models_rob <- list(
+  anti_west_r    = h2_aw_r,
+  anti_ukraine_r = h2_au_r,
+  pro_ukraine_r  = h2_puk_r,
+  anti_russia_r  = h2_ar_r,
+  pro_west_r     = h2_pw_r,
+  pro_russia_r   = h2_pr_r
+)
+
+all_h2 <- bind_rows(
+  lapply(names(models_main), function(n)
+    tidy(models_main[[n]]) %>% mutate(model = n)),
+  lapply(names(models_rob), function(n)
+    tidy(models_rob[[n]]) %>% mutate(model = n))
+) %>%
+  filter(term %in% c("foreign_expert",
+                     "topic_blockGeopolitical",
+                     "year")) %>%
+  select(model, term, estimate, std.error, p.value)
+
+print(all_h2, n = 100)
+
+print(outcome_counts)
+
+# ── Mention frequency robustness for H2 ───────────────────────────────────
+
+# Reuse expert_article_counts from H1 section
+# (if running independently, recompute here)
+expert_article_counts <- master_dataset %>%
+  distinct(expert_id, row_id) %>%
+  count(expert_id, name = "n_articles")
+
+h2_data <- h2_data %>%
+  left_join(expert_article_counts, by = "expert_id") %>%
+  mutate(inv_freq_weight = 1 / n_articles)
+
+# Rare experts dataset
+h2_data_rare <- h2_data %>% filter(n_articles <= 5)
+
+# ── Rare experts models ────────────────────────────────────────────────────
+
+h2_aw_rare  <- glm(anti_west            ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+h2_au_rare  <- glm(anti_ukraine         ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+h2_puk_rare <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+h2_ar_rare  <- glm(anti_russia          ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+h2_pw_rare  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+h2_pr_rare  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+                   data = h2_data_rare, family = binomial)
+
+# ── Inverse frequency weighted models ─────────────────────────────────────
+
+h2_aw_wt  <- glm(anti_west            ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+h2_au_wt  <- glm(anti_ukraine         ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+h2_puk_wt <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+h2_ar_wt  <- glm(anti_russia          ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+h2_pw_wt  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+h2_pr_wt  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+                 data = h2_data, family = binomial, weights = inv_freq_weight)
+
+# ── Outcome counts for rare sample ────────────────────────────────────────
+
+counts_rare <- h2_data_rare %>%
+  summarise(
+    aw  = sum(anti_west,            na.rm = TRUE),
+    au  = sum(anti_ukraine,         na.rm = TRUE),
+    puk = sum(any_positive_ukraine, na.rm = TRUE),
+    ar  = sum(anti_russia,          na.rm = TRUE),
+    pw  = sum(any_positive_west,    na.rm = TRUE),
+    pr  = sum(any_positive_russia,  na.rm = TRUE)
+  )
+
+counts_rare_note <- paste0(
+  "Outcome event counts (rare experts sample, n_articles <= 5): ",
+  "Anti-West = ",    counts_rare$aw,  ", ",
+  "Anti-Ukraine = ", counts_rare$au,  ", ",
+  "Pro-Ukraine = ",  counts_rare$puk, ", ",
+  "Anti-Russia = ",  counts_rare$ar,  ", ",
+  "Pro-West = ",     counts_rare$pw,  ", ",
+  "Pro-Russia = ",   counts_rare$pr,  "."
+)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_rare,
+    "Anti-Ukraine" = h2_au_rare,
+    "Pro-Ukraine"  = h2_puk_rare,
+    "Anti-Russia"  = h2_ar_rare,
+    "Pro-West"     = h2_pw_rare,
+    "Pro-Russia"   = h2_pr_rare,
+    "Anti-West"    = h2_aw_wt,
+    "Anti-Ukraine" = h2_au_wt,
+    "Pro-Ukraine"  = h2_puk_wt,
+    "Anti-Russia"  = h2_ar_wt,
+    "Pro-West"     = h2_pw_wt,
+    "Pro-Russia"   = h2_pr_wt
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Mention frequency",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Rare experts column restricts to experts appearing in 5 or fewer articles.",
+    "Weighted column uses inverse article frequency as observation weight.",
+    counts_note,
+    counts_rare_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 10
+  ) %>%
+  add_header_above(
+    c(" "                            = 1,
+      "Main models"                  = 6,
+      "Rare experts (≤5 articles)"   = 6,
+      "Inverse frequency weighted"   = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13,  background = "#fafafa", italic = TRUE) %>%
+  column_spec(14:19, background = "#f0f0f0", italic = TRUE)
+```
+
+### Expert Frequency robustness: H3
+
+```{r}
+
+library(modelsummary)
+library(kableExtra)
+# ── Data preparation ───────────────────────────────────────────────────────
+h3_data <- master_dataset %>%
+  filter(dominant_topic_clean != "Other / no clear topic") %>%
+  mutate(
+    topic_block = factor(
+      if_else(topic_group == "geopolitics", "Geopolitical", "Domestic / other"),
+      levels = c("Domestic / other", "Geopolitical")
+    )
+  )
+h3_data_restricted <- h3_data %>%
+  filter(expert_country_maxconf >= 0.85)
+# ── Models ─────────────────────────────────────────────────────────────────
+h3_m1 <- glm(anti_west ~ foreign_expert + topic_block,
+             data   = h3_data,
+             family = binomial)
+h3_m2 <- glm(anti_west ~ foreign_expert + topic_block + year,
+             data   = h3_data,
+             family = binomial)
+h3_m3 <- glm(anti_west ~ foreign_expert * topic_block + year,
+             data   = h3_data,
+             family = binomial)
+h3_m4 <- glm(anti_west ~ foreign_expert * topic_block + year,
+             data   = h3_data_restricted,
+             family = binomial)
+# ── Coefficient map ────────────────────────────────────────────────────────
+coef_map <- c(
+  "foreign_expert"                        = "Foreign expert",
+  "topic_blockGeopolitical"               = "Topic: Geopolitical",
+  "foreign_expert:topic_blockGeopolitical" = "Foreign expert x Geopolitical",
+  "year"                                  = "Year"
+)
+# ── Table ──────────────────────────────────────────────────────────────────
+modelsummary(
+  list(
+    "No controls"          = h3_m1,
+    "+ Year"               = h3_m2,
+    "+ Interaction"        = h3_m3,
+    "Restricted (conf. 0.85+)" = h3_m4
+  ),
+  estimate   = "{estimate} ({std.error}){stars}",
+  statistic  = NULL,
+  coef_map   = coef_map,
+  gof_map    = c("nobs", "logLik"),
+  stars      = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title      = "H3: Foreign expert anti-West framing across topic contexts",
+  notes      = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the effect in the domestic/other baseline.",
+    "Interaction term shows how this effect differs in geopolitical topics.",
+    "Column 4 restricted to observations where expert_country_maxconf >= 0.85.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output     = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "           = 1,
+      "Main models" = 3,
+      "Robustness"  = 1)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "
+#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "
+#e8f0f7") %>%
+  column_spec(5, background = "
+#fafafa", italic = TRUE)
+all_h3 <- bind_rows(
+  lapply(list(h3_m1, h3_m2, h3_m3, h3_m4),
+         function(m) tidy(m)) %>%
+    bind_rows(.id = "model")
+) %>%
+  select(model, term, estimate, std.error, p.value)
+print(all_h3, n = 100)
+
+# ── Mention frequency robustness for H3 ───────────────────────────────────
+
+# Reuse expert_article_counts from H1/H2 section
+h3_data <- h3_data %>%
+  left_join(expert_article_counts, by = "expert_id") %>%
+  mutate(inv_freq_weight = 1 / n_articles)
+
+# Rare experts dataset
+h3_data_rare <- h3_data %>% filter(n_articles <= 5)
+
+# ── Models ─────────────────────────────────────────────────────────────────
+
+# Rare experts
+h3_m_rare <- glm(anti_west ~ foreign_expert * topic_block + year,
+                 data   = h3_data_rare,
+                 family = binomial)
+
+# Inverse frequency weighted
+h3_m_weighted <- glm(anti_west ~ foreign_expert * topic_block + year,
+                     data    = h3_data,
+                     family  = binomial,
+                     weights = inv_freq_weight)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "No controls"                = h3_m1,
+    "+ Year"                     = h3_m2,
+    "+ Interaction"              = h3_m3,
+    "Restricted (conf. 0.85+)"   = h3_m4,
+    "Rare experts (≤5 articles)" = h3_m_rare,
+    "Inverse frequency weighted" = h3_m_weighted
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Mention frequency",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the domestic/other baseline.",
+    "Interaction term shows how this differs in geopolitical topics.",
+    "Rare experts column restricts to experts appearing in 5 or fewer articles.",
+    "Weighted column uses inverse article frequency as observation weight.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "           = 1,
+      "Main models" = 3,
+      "Robustness"  = 3)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(5:7, background = "#fafafa", italic = TRUE)
+```
+
+### Robustness Ukraine excluded H1 to H3
+
+```{r}
+# ── Exclude Ukrainian-attributed experts ───────────────────────────────────
+
+# For H1
+h1_data_no_ukr <- h1_data %>%
+  filter(expert_country_master != "Ukraine")
+
+h1_m2_no_ukr <- glm(foreign_expert ~ dominant_topic_clean + year,
+                    data   = h1_data_no_ukr,
+                    family = binomial)
+
+# For H2
+h2_data_no_ukr <- h2_data %>%
+  filter(expert_country_master != "Ukraine")
+
+h2_aw_no_ukr  <- glm(anti_west            ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+h2_au_no_ukr  <- glm(anti_ukraine         ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+h2_puk_no_ukr <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+h2_ar_no_ukr  <- glm(anti_russia          ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+h2_pw_no_ukr  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+h2_pr_no_ukr  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_ukr, family = binomial)
+
+# For H3
+h3_data_no_ukr <- h3_data %>%
+  filter(expert_country_master != "Ukraine")
+
+h3_m3_no_ukr <- glm(anti_west ~ foreign_expert * topic_block + year,
+                    data   = h3_data_no_ukr,
+                    family = binomial)
+
+# ── H1 table ───────────────────────────────────────────────────────────────
+
+coef_map_h1 <- c(
+  "dominant_topic_cleanInternational geopolitics" = "International geopolitics",
+  "dominant_topic_cleanUkraine war"               = "Ukraine war",
+  "dominant_topic_cleanMilitary technology"       = "Military technology",
+  "dominant_topic_cleanEnergy and sanctions"      = "Energy and sanctions",
+  "dominant_topic_cleanMacroeconomy"              = "Macroeconomy",
+  "dominant_topic_cleanOpinion and commentary"    = "Opinion and commentary",
+  "dominant_topic_cleanInformation services"      = "Information services",
+  "dominant_topic_cleanMedia and society"         = "Media and society",
+  "dominant_topic_cleanKremlin governance"        = "Kremlin governance",
+  "dominant_topic_cleanHousing market"            = "Housing market",
+  "dominant_topic_cleanDevelopment and education" = "Development and education",
+  "dominant_topic_cleanCOVID-19 and health"       = "COVID-19 and health",
+  "dominant_topic_cleanGeneral news"              = "General news",
+  "dominant_topic_cleanRegional and local issues" = "Regional and local issues",
+  "year"                                          = "Year (linear)"
+)
+
+modelsummary(
+  list(
+    "Main (+ Year)"        = h1_m2,
+    "Excluding Ukrainians" = h1_m2_no_ukr
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h1,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Excluding Ukrainian-attributed experts",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "Excluding Ukrainian-attributed experts addresses the systematic",
+    "misattribution of Russian domestic experts to Ukraine documented",
+    "in the validation analysis (Appendix C).",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",     1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",               15, 15, bold = FALSE, background = "#f5f5f5") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+
+# ── H2 table ───────────────────────────────────────────────────────────────
+
+counts_no_ukr <- h2_data_no_ukr %>%
+  summarise(
+    aw  = sum(anti_west,            na.rm = TRUE),
+    au  = sum(anti_ukraine,         na.rm = TRUE),
+    puk = sum(any_positive_ukraine, na.rm = TRUE),
+    ar  = sum(anti_russia,          na.rm = TRUE),
+    pw  = sum(any_positive_west,    na.rm = TRUE),
+    pr  = sum(any_positive_russia,  na.rm = TRUE)
+  )
+
+counts_no_ukr_note <- paste0(
+  "Outcome event counts (excluding Ukrainians): ",
+  "Anti-West = ",    counts_no_ukr$aw,  ", ",
+  "Anti-Ukraine = ", counts_no_ukr$au,  ", ",
+  "Pro-Ukraine = ",  counts_no_ukr$puk, ", ",
+  "Anti-Russia = ",  counts_no_ukr$ar,  ", ",
+  "Pro-West = ",     counts_no_ukr$pw,  ", ",
+  "Pro-Russia = ",   counts_no_ukr$pr,  "."
+)
+
+coef_map_h2 <- c(
+  "foreign_expert"          = "Foreign expert",
+  "topic_blockGeopolitical" = "Topic: Geopolitical",
+  "year"                    = "Year"
+)
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_no_ukr,
+    "Anti-Ukraine" = h2_au_no_ukr,
+    "Pro-Ukraine"  = h2_puk_no_ukr,
+    "Anti-Russia"  = h2_ar_no_ukr,
+    "Pro-West"     = h2_pw_no_ukr,
+    "Pro-Russia"   = h2_pr_no_ukr
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h2,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Excluding Ukrainian-attributed experts",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Excluding Ukrainian-attributed experts addresses the systematic",
+    "misattribution of Russian domestic experts to Ukraine documented",
+    "in the validation analysis (Appendix C).",
+    counts_note,
+    counts_no_ukr_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 10
+  ) %>%
+  add_header_above(
+    c(" "                            = 1,
+      "Main models"                  = 6,
+      "Excluding Ukrainians"         = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13, background = "#fafafa", italic = TRUE)
+
+# ── H3 table ───────────────────────────────────────────────────────────────
+
+coef_map_h3 <- c(
+  "foreign_expert"                         = "Foreign expert",
+  "topic_blockGeopolitical"                = "Topic: Geopolitical",
+  "foreign_expert:topic_blockGeopolitical" = "Foreign expert x Geopolitical",
+  "year"                                   = "Year"
+)
+
+modelsummary(
+  list(
+    "Main (+ Interaction)"  = h3_m3,
+    "Excluding Ukrainians"  = h3_m3_no_ukr
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h3,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Excluding Ukrainian-attributed experts",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the",
+    "domestic/other baseline. Interaction term shows how this",
+    "differs in geopolitical topics.",
+    "Excluding Ukrainian-attributed experts addresses the systematic",
+    "misattribution of Russian domestic experts to Ukraine documented",
+    "in the validation analysis (Appendix C).",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+```
+
+### Robustness academics only H1 to H3
+
+```{r}
+# ── Academic experts only robustness ──────────────────────────────────────
+
+# For H1
+h1_data_academic <- h1_data %>%
+  filter(role_class == "academic_expert")
+
+h1_m2_academic <- glm(foreign_expert ~ dominant_topic_clean + year,
+                      data   = h1_data_academic,
+                      family = binomial)
+
+# For H2
+h2_data_academic <- h2_data %>%
+  filter(role_class == "academic_expert")
+
+h2_aw_academic  <- glm(anti_west     ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+h2_au_academic  <- glm(anti_ukraine  ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+h2_puk_academic <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+h2_ar_academic  <- glm(anti_russia   ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+h2_pw_academic  <- glm(any_positive_west ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+h2_pr_academic  <- glm(any_positive_russia ~ foreign_expert + topic_block + year,
+                       data = h2_data_academic, family = binomial)
+
+# For H3
+h3_data_academic <- h3_data %>%
+  filter(role_class == "academic_expert")
+
+h3_m3_academic <- glm(anti_west ~ foreign_expert * topic_block + year,
+                      data   = h3_data_academic,
+                      family = binomial)
+
+# ── H1 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Year)"       = h1_m2,
+    "Academic experts only" = h1_m2_academic
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h1,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Academic experts only",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "Academic experts only column restricts to role_class == academic_expert.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",     1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",               15, 15, bold = FALSE, background = "#f5f5f5") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+
+# ── H2 table ───────────────────────────────────────────────────────────────
+
+counts_academic <- h2_data_academic %>%
+  summarise(
+    aw  = sum(anti_west,         na.rm = TRUE),
+    au  = sum(anti_ukraine,      na.rm = TRUE),
+    puk = sum(any_positive_ukraine,  na.rm = TRUE),
+    ar  = sum(anti_russia,       na.rm = TRUE),
+    pw  = sum(any_positive_west,     na.rm = TRUE),
+    pr  = sum(any_positive_russia,   na.rm = TRUE)
+  )
+
+counts_academic_note <- paste0(
+  "Outcome event counts (academic experts only): ",
+  "Anti-West = ",    counts_academic$aw,  ", ",
+  "Anti-Ukraine = ", counts_academic$au,  ", ",
+  "Pro-Ukraine = ",  counts_academic$puk, ", ",
+  "Anti-Russia = ",  counts_academic$ar,  ", ",
+  "Pro-West = ",     counts_academic$pw,  ", ",
+  "Pro-Russia = ",   counts_academic$pr,  "."
+)
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_academic,
+    "Anti-Ukraine" = h2_au_academic,
+    "Pro-Ukraine"  = h2_puk_academic,
+    "Anti-Russia"  = h2_ar_academic,
+    "Pro-West"     = h2_pw_academic,
+    "Pro-Russia"   = h2_pr_academic
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h2,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Academic experts only",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Academic experts only columns restrict to role_class == academic_expert.",
+    counts_note,
+    counts_academic_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 10
+  ) %>%
+  add_header_above(
+    c(" "                      = 1,
+      "Main models"            = 6,
+      "Academic experts only"  = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13, background = "#fafafa", italic = TRUE)
+
+# ── H3 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Interaction)"  = h3_m3,
+    "Academic experts only" = h3_m3_academic
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h3,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Academic experts only",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the",
+    "domestic/other baseline. Interaction term shows how this",
+    "differs in geopolitical topics.",
+    "Academic experts only column restricts to role_class == academic_expert.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+
+
+h1_data_rare <- h1_data %>% filter(n_articles <= 5)
+
+h1_m2_rare <- glm(foreign_expert ~ dominant_topic_clean + year,
+                  data   = h1_data_rare,
+                  family = binomial)
+
+h1_m2_rare
+
+
+```
+
+### Robustness dropped experts treated as Russian H1
+
+```{r}
+# ── Prepare dropped experts for H1 ────────────────────────────────────────
+
+# Topic label mapping matching dominant_topic_clean in master_dataset
+topic_col_to_label <- c(
+  "macro_economy"           = "Macroeconomy",
+  "media_society"           = "Media and society",
+  "general_news"            = "General news",
+  "housing_market"          = "Housing market",
+  "opinion_discourse"       = "Opinion and commentary",
+  "covid_health"            = "COVID-19 and health",
+  "development_education"   = "Development and education",
+  "energy_sanctions"        = "Energy and sanctions",
+  "military_technology"     = "Military technology",
+  "information_services"    = "Information services",
+  "kremlin_governance"      = "Kremlin governance",
+  "courts_crime"            = "Courts and crime",
+  "regions_local"           = "Regional and local issues",
+  "ukraine_war"             = "Ukraine war",
+  "international_geopolitics" = "International geopolitics"
+)
+
+topic_cols <- names(topic_col_to_label)
+
+dropped_h1 <- dropped_topics_k15 %>%
+  mutate(
+    year = as.integer(format(DateParsed, "%Y")),
+    foreign_expert = 0L,
+    # Find dominant topic column
+    dominant_topic_raw = topic_cols[max.col(across(all_of(topic_cols)))],
+    dominant_topic_clean = recode(dominant_topic_raw, !!!topic_col_to_label)
+  ) %>%
+  select(row_id, year, foreign_expert, dominant_topic_clean)
+
+# ── Combine with h1_data ───────────────────────────────────────────────────
+
+# Keep only the columns needed from h1_data to avoid conflicts
+h1_data_slim <- h1_data %>%
+  select(row_id, year, foreign_expert, dominant_topic_clean)
+
+h1_data_with_dropped <- bind_rows(
+  h1_data_slim,
+  dropped_h1
+) %>%
+  filter(dominant_topic_clean != "No clear topic") %>%
+  mutate(
+    dominant_topic_clean = relevel(
+      factor(dominant_topic_clean),
+      ref = "Courts and crime"
+    )
+  )
+
+# ── Model ──────────────────────────────────────────────────────────────────
+
+h1_m2_dropped <- glm(foreign_expert ~ dominant_topic_clean + year,
+                     data   = h1_data_with_dropped,
+                     family = binomial)
+
+# ── Table ──────────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Year)"              = h1_m2,
+    "Dropped experts as Russian" = h1_m2_dropped
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h1,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Dropped experts treated as Russian",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "Dropped experts column adds approximately 37,000 experts excluded",
+    "from the main analysis due to missing country attribution,",
+    "treating them as Russian domestic experts (foreign_expert = 0).",
+    "This represents the most conservative possible assumption about",
+    "the unattributed expert pool.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",     1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",               15, 15, bold = FALSE, background = "#f5f5f5") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+
+
+```
+
+### Robustness dropped experts treated as Russian H2 and H3
+
+```{r}
+
+library(dplyr)
+library(modelsummary)
+library(kableExtra)
+
+# ── Load dropped sentiment ─────────────────────────────────────────────────
+
+dropped_sentiment <- read.csv(
+  "C:/Users/olemga/OneDrive - PRIO/Documents/MA Thesis/Methods/Data/lenta_dropped_sentiment_full.csv"
+)
+
+library(dplyr)
+library(modelsummary)
+library(kableExtra)
+
+# ── Topic label mapping ────────────────────────────────────────────────────
+
+topic_col_to_label <- c(
+  "macro_economy"             = "Macroeconomy",
+  "media_society"             = "Media and society",
+  "general_news"              = "General news",
+  "housing_market"            = "Housing market",
+  "opinion_discourse"         = "Opinion and commentary",
+  "covid_health"              = "COVID-19 and health",
+  "development_education"     = "Development and education",
+  "energy_sanctions"          = "Energy and sanctions",
+  "military_technology"       = "Military technology",
+  "information_services"      = "Information services",
+  "kremlin_governance"        = "Kremlin governance",
+  "courts_crime"              = "Courts and crime",
+  "regions_local"             = "Regional and local issues",
+  "ukraine_war"               = "Ukraine war",
+  "international_geopolitics" = "International geopolitics"
+)
+
+geopolitical_topics <- c(
+  "Ukraine war",
+  "International geopolitics",
+  "Military technology",
+  "Energy and sanctions"
+)
+
+topic_cols <- names(topic_col_to_label)
+
+# ── Build topic assignment from dropped_topics_k15 ─────────────────────────
+
+dropped_topics_slim <- dropped_topics_k15 %>%
+  mutate(
+    row_id               = as.numeric(row_id),
+    dominant_topic_raw   = topic_cols[max.col(across(all_of(topic_cols)))],
+    dominant_topic_clean = recode(dominant_topic_raw, !!!topic_col_to_label),
+    topic_group          = if_else(
+      dominant_topic_clean %in% geopolitical_topics,
+      "geopolitics",
+      "domestic"
+    ),
+    topic_block = factor(
+      if_else(topic_group == "geopolitics", "Geopolitical", "Domestic / other"),
+      levels = c("Domestic / other", "Geopolitical")
+    )
+  ) %>%
+  select(row_id, dominant_topic_clean, topic_group, topic_block)
+
+# ── Join topics onto dropped sentiment ────────────────────────────────────
+
+dropped_for_h2 <- dropped_sentiment %>%
+  mutate(row_id = as.numeric(row_id)) %>%
+  left_join(dropped_topics_slim, by = "row_id") %>%
+  mutate(
+    foreign_expert = 0L,
+    year           = as.integer(format(as.Date(DateParsed), "%Y"))
+  ) %>%
+  filter(
+    !is.na(year),
+    !is.na(topic_block)
+  ) %>%
+  select(
+    row_id, year, foreign_expert, topic_block,
+    any_anti_west, any_anti_ukraine, any_positive_ukraine,
+    any_anti_russia, any_positive_west, any_positive_russia
+  )
+
+# ── Slim h2_data to matching columns ──────────────────────────────────────
+
+h2_data_slim <- h2_data %>%
+  rename(
+    any_anti_west    = anti_west,
+    any_anti_russia  = anti_russia
+  ) %>%
+  select(
+    row_id, year, foreign_expert, topic_block,
+    any_anti_west, anti_ukraine, any_positive_ukraine,
+    any_anti_russia, any_positive_west, any_positive_russia
+  )
+
+# ── Diagnostics ────────────────────────────────────────────────────────────
+
+cat("Row ID overlap check (should be 0):\n")
+print(sum(dropped_for_h2$row_id %in% h2_data_slim$row_id))
+
+cat("\ndropped_for_h2 rows:\n")
+print(nrow(dropped_for_h2))
+
+cat("\nTopic block distribution in dropped:\n")
+print(table(dropped_for_h2$topic_block))
+
+# ── Combine ────────────────────────────────────────────────────────────────
+
+h2_data_with_dropped <- bind_rows(h2_data_slim, dropped_for_h2)
+
+cat("\nCombined dataset rows:\n")
+print(nrow(h2_data_with_dropped))
+
+cat("\nForeign expert distribution:\n")
+print(table(h2_data_with_dropped$foreign_expert))
+
+# ── H2 models ──────────────────────────────────────────────────────────────
+
+h2_aw_dropped  <- glm(any_anti_west        ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+h2_au_dropped  <- glm(anti_ukraine     ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+h2_puk_dropped <- glm(any_positive_ukraine ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+h2_ar_dropped  <- glm(any_anti_russia      ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+h2_pw_dropped  <- glm(any_positive_west    ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+h2_pr_dropped  <- glm(any_positive_russia  ~ foreign_expert + topic_block + year,
+                      data = h2_data_with_dropped, family = binomial)
+
+# ── H3 model ───────────────────────────────────────────────────────────────
+
+h3_m3_dropped <- glm(any_anti_west ~ foreign_expert * topic_block + year,
+                     data   = h2_data_with_dropped,
+                     family = binomial)
+
+# ── Outcome counts ─────────────────────────────────────────────────────────
+
+counts_dropped_h2 <- h2_data_with_dropped %>%
+  summarise(
+    aw  = sum(any_anti_west,          na.rm = TRUE),
+    au  = sum(any_anti_ukraine,       na.rm = TRUE),
+    puk = sum(any_positive_ukraine,   na.rm = TRUE),
+    ar  = sum(any_anti_russia,        na.rm = TRUE),
+    pw  = sum(any_positive_west,      na.rm = TRUE),
+    pr  = sum(any_positive_russia,    na.rm = TRUE)
+  )
+
+counts_dropped_note <- paste0(
+  "Outcome event counts (with dropped experts as Russian): ",
+  "Anti-West = ",    counts_dropped_h2$aw,  ", ",
+  "Anti-Ukraine = ", counts_dropped_h2$au,  ", ",
+  "Pro-Ukraine = ",  counts_dropped_h2$puk, ", ",
+  "Anti-Russia = ",  counts_dropped_h2$ar,  ", ",
+  "Pro-West = ",     counts_dropped_h2$pw,  ", ",
+  "Pro-Russia = ",   counts_dropped_h2$pr,  "."
+)
+
+# ── Coefficient maps ───────────────────────────────────────────────────────
+
+coef_map_h2 <- c(
+  "foreign_expert"          = "Foreign expert",
+  "topic_blockGeopolitical" = "Topic: Geopolitical",
+  "year"                    = "Year"
+)
+
+coef_map_h3 <- c(
+  "foreign_expert"                         = "Foreign expert",
+  "topic_blockGeopolitical"                = "Topic: Geopolitical",
+  "foreign_expert:topic_blockGeopolitical" = "Foreign expert x Geopolitical",
+  "year"                                   = "Year"
+)
+
+# ── H2 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_dropped,
+    "Anti-Ukraine" = h2_au_dropped,
+    "Pro-Ukraine"  = h2_puk_dropped,
+    "Anti-Russia"  = h2_ar_dropped,
+    "Pro-West"     = h2_pw_dropped,
+    "Pro-Russia"   = h2_pr_dropped
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h2,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Dropped experts treated as Russian",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Dropped experts column adds experts excluded from the main",
+    "analysis due to missing country attribution, treating them",
+    "as Russian domestic experts. This is the most conservative",
+    "possible assumption about the unattributed expert pool.",
+    counts_note,
+    counts_dropped_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 10
+  ) %>%
+  add_header_above(
+    c(" "                          = 1,
+      "Main models"                = 6,
+      "Dropped experts as Russian" = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13, background = "#fafafa", italic = TRUE)
+
+# ── H3 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Interaction)"       = h3_m3,
+    "Dropped experts as Russian" = h3_m3_dropped
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h3,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Dropped experts treated as Russian",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the",
+    "domestic/other baseline. Interaction term shows how this",
+    "differs in geopolitical topics.",
+    "Dropped experts treated as Russian domestic experts.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+```
+
+### Robustness: alternative explanations H1 H3
+
+```{r}
+# ── H1: Alternative specifications ────────────────────────────────────────
+
+# Probit
+h1_probit <- glm(foreign_expert ~ dominant_topic_clean + year,
+                 data   = h1_data,
+                 family = binomial(link = "probit"))
+
+# Linear probability model
+h1_lpm <- lm(foreign_expert ~ dominant_topic_clean + year,
+             data = h1_data)
+
+# ── H1 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Logit (main)"  = h1_m2,
+    "Probit"        = h1_probit,
+    "LPM"           = h1_lpm
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h1,
+  gof_map   = c("nobs", "logLik", "r.squared"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Alternative model specifications",
+  notes     = c(
+    "Logit and probit coefficients are log-odds and probit coefficients",
+    "respectively. LPM coefficients are percentage point differences.",
+    "Standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",     1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",               15, 15, bold = FALSE, background = "#f5f5f5") %>%
+  add_header_above(
+    c(" "                             = 1,
+      "Main"                          = 1,
+      "Alternative specifications"    = 2)
+  ) %>%
+  column_spec(3:4, background = "#fafafa", italic = TRUE)
+
+# ── H2: Alternative specifications ────────────────────────────────────────
+
+# Probit models
+h2_aw_probit  <- glm(anti_west          ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+h2_au_probit  <- glm(anti_ukraine       ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+h2_puk_probit <- glm(any_positive_ukraine   ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+h2_ar_probit  <- glm(anti_russia        ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+h2_pw_probit  <- glm(any_positive_west      ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+h2_pr_probit  <- glm(any_positive_russia    ~ foreign_expert + topic_block + year,
+                     data = h2_data, family = binomial(link = "probit"))
+
+# LPM models
+h2_aw_lpm  <- lm(anti_west          ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+h2_au_lpm  <- lm(anti_ukraine       ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+h2_puk_lpm <- lm(any_positive_ukraine   ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+h2_ar_lpm  <- lm(anti_russia        ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+h2_pw_lpm  <- lm(any_positive_west      ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+h2_pr_lpm  <- lm(any_positive_russia    ~ foreign_expert + topic_block + year,
+                 data = h2_data)
+
+# ── H2 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_probit,
+    "Anti-Ukraine" = h2_au_probit,
+    "Pro-Ukraine"  = h2_puk_probit,
+    "Anti-Russia"  = h2_ar_probit,
+    "Pro-West"     = h2_pw_probit,
+    "Pro-Russia"   = h2_pr_probit,
+    "Anti-West"    = h2_aw_lpm,
+    "Anti-Ukraine" = h2_au_lpm,
+    "Pro-Ukraine"  = h2_puk_lpm,
+    "Anti-Russia"  = h2_ar_lpm,
+    "Pro-West"     = h2_pw_lpm,
+    "Pro-Russia"   = h2_pr_lpm
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h2,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Alternative model specifications",
+  notes     = c(
+    "Logit and probit report log-odds and probit coefficients respectively.",
+    "LPM reports percentage point differences.",
+    "Standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    counts_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 9
+  ) %>%
+  add_header_above(
+    c(" "                          = 1,
+      "Logit (main)"               = 6,
+      "Probit"                     = 6,
+      "LPM"                        = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13,  background = "#fafafa", italic = TRUE) %>%
+  column_spec(14:19, background = "#f0f0f0", italic = TRUE)
+
+# ── H3: Alternative specifications ────────────────────────────────────────
+
+# Probit
+h3_probit <- glm(anti_west ~ foreign_expert * topic_block + year,
+                 data   = h3_data,
+                 family = binomial(link = "probit"))
+
+# LPM
+h3_lpm <- lm(anti_west ~ foreign_expert * topic_block + year,
+             data = h3_data)
+
+# ── H3 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Logit (main)" = h3_m3,
+    "Probit"       = h3_probit,
+    "LPM"          = h3_lpm
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h3,
+  gof_map   = c("nobs", "logLik", "r.squared"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Alternative model specifications",
+  notes     = c(
+    "Logit and probit report log-odds and probit coefficients respectively.",
+    "LPM reports percentage point differences.",
+    "Standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the",
+    "domestic/other baseline. Interaction term shows how this",
+    "differs in geopolitical topics.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "                          = 1,
+      "Main"                       = 1,
+      "Alternative specifications" = 2)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(3:4, background = "#fafafa", italic = TRUE)
+```
+
+### Robustness: exclude government official h1 h3
+
+```{r}
+# ── Exclude government officials ───────────────────────────────────────────
+
+h1_data_no_gov <- h1_data %>%
+  filter(role_class != "government_official")
+
+h2_data_no_gov <- h2_data %>%
+  filter(role_class != "government_official")
+
+h3_data_no_gov <- h3_data %>%
+  filter(role_class != "government_official")
+
+# ── H1 model ───────────────────────────────────────────────────────────────
+
+h1_m2_no_gov <- glm(foreign_expert ~ dominant_topic_clean + year,
+                    data   = h1_data_no_gov,
+                    family = binomial)
+
+# ── H2 models ──────────────────────────────────────────────────────────────
+
+h2_aw_no_gov  <- glm(anti_west          ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+h2_au_no_gov  <- glm(anti_ukraine       ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+h2_puk_no_gov <- glm(any_positive_ukraine   ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+h2_ar_no_gov  <- glm(anti_russia        ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+h2_pw_no_gov  <- glm(any_positive_west      ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+h2_pr_no_gov  <- glm(any_positive_russia    ~ foreign_expert + topic_block + year,
+                     data = h2_data_no_gov, family = binomial)
+
+# ── H3 model ───────────────────────────────────────────────────────────────
+
+h3_m3_no_gov <- glm(anti_west ~ foreign_expert * topic_block + year,
+                    data   = h3_data_no_gov,
+                    family = binomial)
+
+# ── Sample size check ──────────────────────────────────────────────────────
+
+cat("H1 sample sizes:\n")
+cat("Main:", nrow(h1_data), "\n")
+cat("No government officials:", nrow(h1_data_no_gov), "\n")
+cat("Removed:", nrow(h1_data) - nrow(h1_data_no_gov), "\n")
+
+cat("\nH2 sample sizes:\n")
+cat("Main:", nrow(h2_data), "\n")
+cat("No government officials:", nrow(h2_data_no_gov), "\n")
+
+# ── Outcome counts ─────────────────────────────────────────────────────────
+
+counts_no_gov <- h2_data_no_gov %>%
+  summarise(
+    aw  = sum(anti_west,          na.rm = TRUE),
+    au  = sum(anti_ukraine,       na.rm = TRUE),
+    puk = sum(any_positive_ukraine,   na.rm = TRUE),
+    ar  = sum(anti_russia,        na.rm = TRUE),
+    pw  = sum(any_positive_west,      na.rm = TRUE),
+    pr  = sum(any_positive_russia,    na.rm = TRUE)
+  )
+
+counts_no_gov_note <- paste0(
+  "Outcome event counts (excluding government officials): ",
+  "Anti-West = ",    counts_no_gov$aw,  ", ",
+  "Anti-Ukraine = ", counts_no_gov$au,  ", ",
+  "Pro-Ukraine = ",  counts_no_gov$puk, ", ",
+  "Anti-Russia = ",  counts_no_gov$ar,  ", ",
+  "Pro-West = ",     counts_no_gov$pw,  ", ",
+  "Pro-Russia = ",   counts_no_gov$pr,  "."
+)
+
+# ── H1 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Year)"                  = h1_m2,
+    "Excluding government officials" = h1_m2_no_gov
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h1,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H1 Robustness: Excluding government officials",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: Courts and crime topic.",
+    "Excluding government officials removes role_class == government_official.",
+    "Government officials are not expert voices in the journalistic sense",
+    "and their inclusion may conflate editorial selection of expert credibility",
+    "with routine citation of official sources.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  pack_rows("Geopolitical topics",     1,  4, bold = TRUE, background = "#e8f0f7") %>%
+  pack_rows("Domestic / other topics", 5, 14, bold = TRUE, background = "#f7f0e8") %>%
+  pack_rows("Controls",               15, 15, bold = FALSE, background = "#f5f5f5") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+
+# ── H2 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Anti-West"    = h2_aw,
+    "Anti-Ukraine" = h2_au,
+    "Pro-Ukraine"  = h2_puk,
+    "Anti-Russia"  = h2_ar,
+    "Pro-West"     = h2_pw,
+    "Pro-Russia"   = h2_pr,
+    "Anti-West"    = h2_aw_no_gov,
+    "Anti-Ukraine" = h2_au_no_gov,
+    "Pro-Ukraine"  = h2_puk_no_gov,
+    "Anti-Russia"  = h2_ar_no_gov,
+    "Pro-West"     = h2_pw_no_gov,
+    "Pro-Russia"   = h2_pr_no_gov
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h2,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H2 Robustness: Excluding government officials",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Excluding government officials removes role_class == government_official.",
+    counts_note,
+    counts_no_gov_note,
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 10
+  ) %>%
+  add_header_above(
+    c(" "                              = 1,
+      "Main models"                    = 6,
+      "Excluding government officials" = 6)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(8:13, background = "#fafafa", italic = TRUE)
+
+# ── H3 table ───────────────────────────────────────────────────────────────
+
+modelsummary(
+  list(
+    "Main (+ Interaction)"           = h3_m3,
+    "Excluding government officials" = h3_m3_no_gov
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h3,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 Robustness: Excluding government officials",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, domestic/other topic.",
+    "Foreign expert coefficient captures the association in the",
+    "domestic/other baseline. Interaction term shows how this",
+    "differs in geopolitical topics.",
+    "Excluding government officials removes role_class == government_official.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7") %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7") %>%
+  column_spec(3, background = "#fafafa", italic = TRUE)
+```
+
+### Robustness h4
+
+```{r}
+
+# Restrict to post-2014 for main H4 models
+h4_data <- h2_data %>% filter(year >= 2014)
+
+# Alternative cutoff: 2013
+h4_data_2013 <- h2_data %>% filter(year >= 2013)
+
+# Alternative cutoff: 2015  
+h4_data_2015 <- h2_data %>% filter(year >= 2015)
+
+# Exclude post-2022
+h4_data_no2022 <- h2_data %>% filter(year >= 2014 & year < 2022)
+
+# Pre-2014 placebo
+h4_data_pre2014 <- h2_data %>% filter(year < 2014)
+
+# Models: anti-West outcome only since that is the H4 focus
+h4_main    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data = h4_data, family = binomial)
+h4_2013    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data = h4_data_2013, family = binomial)
+h4_2015    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data = h4_data_2015, family = binomial)
+h4_no2022  <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data = h4_data_no2022, family = binomial)
+h4_placebo <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data = h4_data_pre2014, family = binomial)
+
+
+summary(h4_main)
+summary(h4_2013)
+summary(h4_2015)
+summary(h4_no2022)
+summary(h4_placebo)
+
+# Check variable name consistency
+h4_data_pre2014 <- h2_data %>% filter(year < 2014)
+
+# Interaction model on full dataset
+h4_interaction <- glm(anti_west ~ foreign_expert * post_2014 + 
+                        topic_block + year,
+                      data = h2_data %>% 
+                        mutate(post_2014 = as.integer(year >= 2014)),
+                      family = binomial)
+
+summary(h4_interaction)
+
+# ── Split by topic block and period ───────────────────────────────────────
+
+# Geopolitical topics only
+h4_geo_pre2014  <- h2_data %>% 
+  filter(year < 2014, topic_block == "Geopolitical")
+
+h4_geo_post2014 <- h2_data %>% 
+  filter(year >= 2014, topic_block == "Geopolitical")
+
+# Domestic topics only
+h4_dom_pre2014  <- h2_data %>% 
+  filter(year < 2014, topic_block == "Domestic / other")
+
+h4_dom_post2014 <- h2_data %>% 
+  filter(year >= 2014, topic_block == "Domestic / other")
+
+# Models
+h4_geo_pre  <- glm(anti_west ~ foreign_expert + year,
+                   data = h4_geo_pre2014,  family = binomial)
+h4_geo_post <- glm(anti_west ~ foreign_expert + year,
+                   data = h4_geo_post2014, family = binomial)
+h4_dom_pre  <- glm(anti_west ~ foreign_expert + year,
+                   data = h4_dom_pre2014,  family = binomial)
+h4_dom_post <- glm(anti_west ~ foreign_expert + year,
+                   data = h4_dom_post2014, family = binomial)
+
+summary(h4_geo_pre)
+summary(h4_geo_post)
+summary(h4_dom_pre)
+summary(h4_dom_post)
+
+coef_map_h4 <- c(
+  "foreign_expert"          = "Foreign expert",
+  "topic_blockGeopolitical" = "Topic: Geopolitical",
+  "year"                    = "Year"
+)
+
+modelsummary(
+  list(
+    "Geopolitical pre-2014"  = h4_geo_pre,
+    "Geopolitical post-2014" = h4_geo_post,
+    "Domestic pre-2014"      = h4_dom_pre,
+    "Domestic post-2014"     = h4_dom_post
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h4,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H4 Robustness: Foreign expert anti-West coefficient by topic block and period",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Outcome: anti-West sentiment. Baseline: domestic expert.",
+    "Topic block fixed within each model — geopolitical models",
+    "include only geopolitical articles, domestic models include",
+    "only domestic and other articles.",
+    "Pre-2014 period uses editorially independent Lenta.ru as baseline.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "              = 1,
+      "Geopolitical"   = 2,
+      "Domestic"       = 2)
+  ) %>%
+  column_spec(2:3, background = "#e8f0f7") %>%
+  column_spec(4:5, background = "#f7f0e8")
+
+# ── Periodization checks on full dataset ──────────────────────────────────
+
+h4_main    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data   = h2_data %>% filter(year >= 2014),
+                  family = binomial)
+
+h4_2013    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data   = h2_data %>% filter(year >= 2013),
+                  family = binomial)
+
+h4_2015    <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data   = h2_data %>% filter(year >= 2015),
+                  family = binomial)
+
+h4_no2022  <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data   = h2_data %>% filter(year >= 2014 & year < 2022),
+                  family = binomial)
+
+h4_placebo <- glm(anti_west ~ foreign_expert + topic_block + year,
+                  data   = h2_data %>% filter(year < 2014),
+                  family = binomial)
+
+modelsummary(
+  list(
+    "Main (2014--2024)"  = h4_main,
+    "Alt. cutoff 2013"   = h4_2013,
+    "Alt. cutoff 2015"   = h4_2015,
+    "Excl. 2022--2024"   = h4_no2022,
+    "Pre-2014 placebo"   = h4_placebo
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_h4,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H4 Robustness: Periodization checks",
+  notes     = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Outcome: anti-West sentiment. Baseline: domestic expert,",
+    "domestic/other topic.",
+    "Main model restricted to 2014 onward. Alternative cutoff",
+    "models use 2013 and 2015 as alternative start dates.",
+    "Excl. 2022-2024 removes the acute war period.",
+    "Pre-2014 placebo uses the editorially independent period.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output    = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 12
+  ) %>%
+  add_header_above(
+    c(" "                    = 1,
+      "Periodization checks" = 3,
+      "Exclusion"            = 1,
+      "Placebo"              = 1)
+  ) %>%
+  column_spec(5, background = "#fafafa", italic = TRUE) %>%
+  column_spec(6, background = "#f0f0f0", italic = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(scales)
+library(tidyr)
+
+# ── Step 1: Total articles per month from full corpus ──────────────────────
+
+articles_per_month <- lenta_news_1999_2024 %>%
+  mutate(
+    date  = as.Date(date),
+    month = floor_date(date, "month")
+  ) %>%
+  filter(!is.na(month)) %>%
+  count(month, name = "n_articles_total")
+
+# ── Step 2: Articles with foreign and domestic experts per month ──────────
+# Count distinct articles (row_id) per month for each expert type
+
+articles_with_experts <- master_dataset %>%
+  mutate(
+    date  = as.Date(date),
+    month = floor_date(date, "month")
+  ) %>%
+  filter(!is.na(month)) %>%
+  group_by(month) %>%
+  summarise(
+    n_articles_foreign  = n_distinct(row_id[foreign_expert == 1]),
+    n_articles_domestic = n_distinct(row_id[foreign_expert == 0]),
+    .groups = "drop"
+  )
+
+# ── Step 3: Combine and compute shares ────────────────────────────────────
+
+monthly_shares <- articles_per_month %>%
+  left_join(articles_with_experts, by = "month") %>%
+  mutate(
+    n_articles_foreign  = ifelse(is.na(n_articles_foreign),  0, n_articles_foreign),
+    n_articles_domestic = ifelse(is.na(n_articles_domestic), 0, n_articles_domestic),
+    share_foreign       = n_articles_foreign  / n_articles_total,
+    share_domestic      = n_articles_domestic / n_articles_total
+  ) %>%
+  filter(month >= as.Date("1999-09-01") & month <= as.Date("2024-06-30"))
+
+# ── Step 4: Pivot for plotting ────────────────────────────────────────────
+
+plot_data <- monthly_shares %>%
+  select(month, share_foreign, share_domestic) %>%
+  pivot_longer(
+    cols      = c(share_foreign, share_domestic),
+    names_to  = "expert_type",
+    values_to = "share"
+  ) %>%
+  mutate(
+    Expert = factor(expert_type,
+                    levels = c("share_domestic", "share_foreign"),
+                    labels = c("Domestic", "Foreign"))
+  )
+
+# ── Step 5: Plot in Figure 6.4 style ──────────────────────────────────────
+
+ggplot(plot_data, aes(x = month, y = share, color = Expert)) +
+  
+  # Raw monthly line (light)
+  geom_line(linewidth = 0.4, alpha = 0.4) +
+  
+  # Smoothed trend
+  geom_smooth(
+    method    = "loess",
+    span      = 0.15,
+    se        = FALSE,
+    linewidth = 1.2
+  ) +
+  
+  # 2014 editorial change
+  geom_vline(
+    xintercept = as.Date("2014-03-01"),
+    linetype   = "dashed",
+    color      = "grey50",
+    linewidth  = 0.5
+  ) +
+  annotate(
+    "text",
+    x        = as.Date("2014-03-01"),
+    y        = Inf,
+    label    = "Editorial change",
+    angle    = 90,
+    vjust    = -0.4,
+    hjust    = 1.1,
+    size     = 3,
+    color    = "grey40",
+    fontface = "italic"
+  ) +
+  
+  # 2020 COVID-19
+  geom_vline(
+    xintercept = as.Date("2020-03-01"),
+    linetype   = "dashed",
+    color      = "grey50",
+    linewidth  = 0.5
+  ) +
+  annotate(
+    "text",
+    x        = as.Date("2020-03-01"),
+    y        = Inf,
+    label    = "COVID-19",
+    angle    = 90,
+    vjust    = -0.4,
+    hjust    = 1.1,
+    size     = 3,
+    color    = "grey40",
+    fontface = "italic"
+  ) +
+  
+  # 2022 invasion
+  geom_vline(
+    xintercept = as.Date("2022-02-24"),
+    linetype   = "dashed",
+    color      = "grey50",
+    linewidth  = 0.5
+  ) +
+  annotate(
+    "text",
+    x        = as.Date("2022-02-24"),
+    y        = Inf,
+    label    = "Ukraine invasion",
+    angle    = 90,
+    vjust    = -0.4,
+    hjust    = 1.1,
+    size     = 3,
+    color    = "grey40",
+    fontface = "italic"
+  ) +
+  
+  scale_color_manual(
+    values = c("Domestic" = "#b04a4a", "Foreign" = "#2b6cb0"),
+    name   = NULL
+  ) +
+  
+  scale_x_date(
+    date_breaks = "3 years",
+    date_labels = "%Y"
+  ) +
+  
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  
+  labs(
+    x        = NULL,
+    y        = "Share of articles with expert mention",
+    title    = "Expert use as share of total articles published",
+    subtitle = "Monthly shares with smoothed trends. Dashed lines mark key editorial and geopolitical events."
+  ) +
+  
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(size = 10, color = "grey30"),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+### new H3
+
+```{r}
+library(broom)  # for tidy() in the diagnostic dump at the end
+
+# ── Additional data prep ──────────────────────────────────────────────────
+
+# Stratified subsets
+h3_domestic              <- h3_data            %>% filter(topic_block == "Domestic / other")
+h3_geopolitical          <- h3_data            %>% filter(topic_block == "Geopolitical")
+h3_domestic_restricted   <- h3_data_restricted %>% filter(topic_block == "Domestic / other")
+h3_geopolitical_restricted <- h3_data_restricted %>% filter(topic_block == "Geopolitical")
+
+# Reparameterized data: geopolitical as reference category
+h3_data_georef            <- h3_data %>%
+  mutate(topic_block = factor(topic_block,
+                              levels = c("Geopolitical", "Domestic / other")))
+h3_data_georef_restricted <- h3_data_restricted %>%
+  mutate(topic_block = factor(topic_block,
+                              levels = c("Geopolitical", "Domestic / other")))
+
+
+# ── Stratified models (headline H3 table) ─────────────────────────────────
+
+h3_dom_m1 <- glm(anti_west ~ foreign_expert,        data = h3_domestic,            family = binomial)
+h3_dom_m2 <- glm(anti_west ~ foreign_expert + year, data = h3_domestic,            family = binomial)
+h3_dom_m3 <- glm(anti_west ~ foreign_expert + year, data = h3_domestic_restricted, family = binomial)
+
+h3_geo_m1 <- glm(anti_west ~ foreign_expert,        data = h3_geopolitical,            family = binomial)
+h3_geo_m2 <- glm(anti_west ~ foreign_expert + year, data = h3_geopolitical,            family = binomial)
+h3_geo_m3 <- glm(anti_west ~ foreign_expert + year, data = h3_geopolitical_restricted, family = binomial)
+
+coef_map_strat <- c(
+  "foreign_expert" = "Foreign expert",
+  "year"           = "Year"
+)
+
+modelsummary(
+  list(
+    "(1)" = h3_dom_m1, "(2)" = h3_dom_m2, "(3)" = h3_dom_m3,
+    "(4)" = h3_geo_m1, "(5)" = h3_geo_m2, "(6)" = h3_geo_m3
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_strat,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3: Foreign expert anti-West framing, stratified by topic block",
+  notes = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Each column is a separate logistic regression on the indicated subset.",
+    "Columns (1)-(3): articles in domestic / other topics (economic, health, legal, regional, etc.).",
+    "Columns (4)-(6): articles in geopolitical topics (international geopolitics, Ukraine war, security).",
+    "Columns (3) and (6) restricted to expert_country_maxconf >= 0.85.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 12
+  ) %>%
+  add_header_above(
+    c(" " = 1, "Domestic / other topics" = 3, "Geopolitical topics" = 3)
+  ) %>%
+  row_spec(1, bold = TRUE, background = "#e8f0f7")  # foreign_expert row
+
+
+# ── Reparameterized interaction model (geopolitical as baseline) ──────────
+
+h3_re_m3 <- glm(anti_west ~ foreign_expert * topic_block + year,
+                data = h3_data_georef,            family = binomial)
+h3_re_m4 <- glm(anti_west ~ foreign_expert * topic_block + year,
+                data = h3_data_georef_restricted, family = binomial)
+
+coef_map_re <- c(
+  "foreign_expert"                              = "Foreign expert",
+  "topic_blockDomestic / other"                 = "Topic: Domestic / other",
+  "foreign_expert:topic_blockDomestic / other"  = "Foreign expert x Domestic",
+  "year"                                        = "Year"
+)
+
+modelsummary(
+  list(
+    "+ Interaction"           = h3_re_m3,
+    "Restricted (conf >=0.85)" = h3_re_m4
+  ),
+  estimate  = "{estimate} ({std.error}){stars}",
+  statistic = NULL,
+  coef_map  = coef_map_re,
+  gof_map   = c("nobs", "logLik"),
+  stars     = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  title     = "H3 (reparameterized): geopolitical topic as reference category",
+  notes = c(
+    "Log-odds coefficients with standard errors in parentheses.",
+    "Baseline: domestic expert, geopolitical topic.",
+    "Foreign expert coefficient captures the foreign-expert effect in geopolitical topics.",
+    "Interaction term shows the additional foreign-expert premium when moving into domestic / other topics.",
+    "* p < 0.05, ** p < 0.01, *** p < 0.001"
+  ),
+  output = "kableExtra"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE,
+    font_size = 12
+  ) %>%
+  row_spec(3, bold = TRUE, background = "#e8f0f7")  # interaction row
+
+
+# ── Diagnostic dump ───────────────────────────────────────────────────────
+
+all_h3_strat <- bind_rows(
+  lapply(
+    list(
+      h3_dom_m1 = h3_dom_m1, h3_dom_m2 = h3_dom_m2, h3_dom_m3 = h3_dom_m3,
+      h3_geo_m1 = h3_geo_m1, h3_geo_m2 = h3_geo_m2, h3_geo_m3 = h3_geo_m3,
+      h3_re_m3  = h3_re_m3,  h3_re_m4  = h3_re_m4
+    ),
+    tidy
+  ),
+  .id = "model"
+) %>%
+  select(model, term, estimate, std.error, p.value)
+
+print(all_h3_strat, n = 100)
+```
+
+```{r}
+library(marginaleffects)
+library(ggplot2)
+library(scales)
+
+# ── Model used for predictions ────────────────────────────────────────────
+# Original parameterization (domestic-block as baseline) — matches the
+# interaction model in the thesis. Predictions are identical regardless of
+# which factor level is reference; using this version for continuity.
+
+h3_pred_model <- glm(
+  anti_west ~ foreign_expert * topic_block + year,
+  data = h3_data,
+  family = binomial
+)
+
+
+# ── Predicted probabilities, averaged across observed year distribution ──
+
+preds <- avg_predictions(
+  h3_pred_model,
+  by = c("foreign_expert", "topic_block")
+) %>%
+  as_tibble() %>%
+  mutate(
+    expert_label = factor(
+      if_else(foreign_expert == 1, "Foreign expert", "Domestic expert"),
+      levels = c("Domestic expert", "Foreign expert")
+    ),
+    topic_block = factor(
+      topic_block,
+      levels = c("Domestic / other", "Geopolitical")
+    )
+  )
+
+print(preds)
+
+
+# ── Within-topic contrasts (foreign minus domestic, in pp) ───────────────
+
+contrasts_h3 <- avg_comparisons(
+  h3_pred_model,
+  variables = "foreign_expert",
+  by = "topic_block"
+) %>%
+  as_tibble()
+
+print(contrasts_h3)
+
+
+# ── Figure ────────────────────────────────────────────────────────────────
+
+p_h3 <- ggplot(
+  preds,
+  aes(x = topic_block, y = estimate,
+      fill = expert_label, group = expert_label)
+) +
+  geom_col(
+    position = position_dodge(width = 0.7),
+    width = 0.6
+  ) +
+  geom_errorbar(
+    aes(ymin = conf.low, ymax = conf.high),
+    position = position_dodge(width = 0.7),
+    width = 0.15,
+    linewidth = 0.5,
+    colour = "grey25"
+  ) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", estimate * 100)),
+    position = position_dodge(width = 0.7),
+    vjust = -1.6,
+    size = 3.4,
+    colour = "grey20"
+  ) +
+  scale_fill_manual(
+    values = c("Domestic expert" = "#8896a3",
+               "Foreign expert"  = "#b04a3f"),
+    name = NULL
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.20))
+  ) +
+  labs(
+    x = NULL,
+    y = "Predicted probability of anti-West sentiment"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "top",
+    legend.key.size    = unit(0.4, "cm"),
+    axis.text.x        = element_text(size = 11),
+    plot.margin        = margin(10, 14, 10, 10)
+  )
+
+print(p_h3)
+
+
+# ── Save (adjust path / dimensions to match your other figures) ──────────
+
+ggsave("fig_h3_predicted_probabilities.png",
+      p_h3, width = 5.5, height = 3.6, device = cairo_pdf)
+```
